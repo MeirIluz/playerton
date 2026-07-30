@@ -17,7 +17,7 @@ from collections import Counter
 import tkinter as tk
 from tkinter import ttk, filedialog, simpledialog
 
-from PIL import Image, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import pygame
 
 from constants import (
@@ -28,8 +28,7 @@ from constants import (
 from logging_setup import logger
 from audio_tags import (
     format_duration, read_track_tags, get_track_duration,
-    make_placeholder_art, make_placeholder_art_pil,
-    get_track_art_image, get_track_art_pil, read_full_metadata,
+    make_placeholder_art_pil, get_track_art_pil, read_full_metadata,
     read_common_tags, apply_common_tags,
 )
 from image_utils import fit_image_cover, apply_low_opacity
@@ -95,6 +94,15 @@ class App:
         self._current_art_pil = None
         self._art_crossfade_job = None
 
+        # "Spinning disk" effect for the Now Playing album art (a CD/
+        # vinyl-style circular crop of the current cover art that rotates
+        # while a track is actively playing, and freezes when paused/
+        # stopped) -- see _set_disk_base/_start_disk_spin.
+        self._disk_base_image = None  # native-res, angle-0 disk (PIL Image)
+        self._disk_hires_image = None  # supersampled, angle-0 disk (for spin)
+        self._disk_angle = 0
+        self._disk_spin_job = None
+
         # Index being dragged in the queue panel, for click-and-drag
         # reordering (session-only UI state).
         self._queue_drag_index = None
@@ -102,7 +110,12 @@ class App:
         # Cue-sheet-backed playlists (see playlist_cue.py), shown under
         # the "Playlists" node in the library tree. Keyed by the cue
         # file's absolute path; each value is
-        # {"name", "tracks": [path, ...], "node_id": tree item id}.
+        # {"name", "tracks": [path, ...], "node_id": tree item id,
+        #  "parent": cue_path of its "mother" playlist, or None}.
+        # "parent" implements one-way playlist inheritance (see
+        # set_playlist_parent/add_tracks_to_playlist): any track added
+        # to a playlist is also propagated up to its parent, and its
+        # parent's parent, and so on -- never the other direction.
         self.playlists = {}
         # Maps a playlist's per-track tree item id -> (cue_path, real_path),
         # since those leaf items use a synthetic iid (a real track path can
@@ -306,8 +319,9 @@ class App:
         frame = ttk.Frame(self.root, relief=tk.RIDGE, borderwidth=1, padding=8)
         frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-        self.now_playing_art_image = make_placeholder_art()
         self._current_art_pil = make_placeholder_art_pil()
+        self._set_disk_base(self._current_art_pil)
+        self.now_playing_art_image = ImageTk.PhotoImage(self._disk_base_image)
         self.art_label = tk.Label(frame, image=self.now_playing_art_image)
         self.art_label.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -668,6 +682,20 @@ class App:
             self.right_box_base_color = self._rgb_of(palette["bg"])
             if self.right_box_bg_source_image is not None:
                 self._set_right_box_background(self.right_box_bg_source_image)
+
+        if getattr(self, "_current_art_pil", None) is not None:
+            # Rebuild the Now Playing "spinning disk" so its corner-fill
+            # color (and rim/hole colors) match the new theme, instead of
+            # keeping the old theme's background baked into the image.
+            self._set_disk_base(self._current_art_pil)
+            if self._disk_spin_job is None:
+                photo = ImageTk.PhotoImage(
+                    self._disk_frame_from_hires(
+                        self._disk_hires_image, self._disk_base_image.size[0],
+                        self._disk_angle)
+                    if self._disk_angle else self._disk_base_image)
+                self.now_playing_art_image = photo
+                self.art_label.config(image=photo)
 
         if getattr(self, "playlist_bg_source_image", None) is not None:
             # Force Tk to finish recomputing geometry from the style
@@ -1701,7 +1729,16 @@ class App:
                 2, label="Rename Playlist...",
                 command=lambda: self.rename_playlist(owning_cue_path))
             menu.insert_command(
-                3, label="Remove Playlist",
+                3, label="Set Mother Playlist...",
+                command=lambda: self.set_playlist_parent(owning_cue_path))
+            next_index = 4
+            if self.playlists.get(owning_cue_path, {}).get("parent"):
+                menu.insert_command(
+                    next_index, label="Clear Mother Playlist",
+                    command=lambda: self._apply_playlist_parent(owning_cue_path, None))
+                next_index += 1
+            menu.insert_command(
+                next_index, label="Remove Playlist",
                 command=lambda: self.remove_playlist(owning_cue_path))
         elif track_owner is not None:
             owner_cue_path, _real_path = track_owner
@@ -1757,7 +1794,9 @@ class App:
     # -- cue-sheet-backed playlists ---------------------------------------
     def create_playlist(self, initial_tracks=None):
         """Prompt for a name and create a new (optionally pre-filled)
-        playlist, backed by a new .cue file under PLAYLISTS_DIR."""
+        playlist, backed by a new .cue file under PLAYLISTS_DIR. Starts
+        with no "mother" playlist set (use set_playlist_parent after the
+        fact to link it under one)."""
         name = simpledialog.askstring(
             "New Playlist", "Playlist name:", parent=self.root)
         if not name or not name.strip():
@@ -1773,14 +1812,18 @@ class App:
         references are copied into a NEW cue file managed by the app
         (under PLAYLISTS_DIR) rather than editing the original in place,
         so importing never modifies a file outside the app's control.
-        Any referenced tracks that no longer exist on disk are skipped."""
+        Any referenced tracks that no longer exist on disk are skipped.
+        Any "mother" playlist link the source file had is NOT carried
+        over (it would point outside this app's managed playlists, or to
+        a stale/unrelated file) -- use set_playlist_parent afterward if
+        needed."""
         src_path = filedialog.askopenfilename(
             title="Import cue playlist",
             filetypes=[("Cue sheets", "*.cue"), ("All files", "*.*")])
         if not src_path:
             return
         try:
-            name, track_paths = read_cue_playlist(src_path)
+            name, track_paths, _src_parent = read_cue_playlist(src_path)
         except OSError as exc:
             self.status_var.set(f"Could not read cue file: {exc}")
             return
@@ -1800,9 +1843,12 @@ class App:
     def _load_playlist_from_cue(self, cue_path, is_restore=False):
         """(Re)read `cue_path` from disk and (re)build its node/tracks in
         the library tree. Used for newly created/imported playlists, and
-        to restore previously loaded ones from the session cache."""
+        to restore previously loaded ones from the session cache. Also
+        (re)loads its "mother" playlist link, if any -- resolved lazily
+        against `self.playlists` at add-time, so it doesn't matter
+        whether the parent cue file has been loaded yet at this point."""
         try:
-            name, track_paths = read_cue_playlist(cue_path)
+            name, track_paths, parent_path = read_cue_playlist(cue_path)
         except OSError as exc:
             if not is_restore:
                 self.status_var.set(f"Could not load playlist: {exc}")
@@ -1814,11 +1860,15 @@ class App:
             node_id = f"playlist::{cue_path}"
             self.library_tree.insert(
                 self._playlists_root_id, tk.END, iid=node_id, text=name, open=False)
-            info = {"name": name, "tracks": existing_tracks, "node_id": node_id}
+            info = {
+                "name": name, "tracks": existing_tracks, "node_id": node_id,
+                "parent": parent_path,
+            }
             self.playlists[cue_path] = info
         else:
             info["name"] = name
             info["tracks"] = existing_tracks
+            info["parent"] = parent_path
             self.library_tree.item(info["node_id"], text=name)
 
         self._populate_playlist_node(cue_path)
@@ -1849,19 +1899,16 @@ class App:
     def add_tracks_to_playlist(self, cue_path, paths):
         """Append `paths` (real track paths) to the playlist at
         `cue_path`, skipping any already in it, and persist the change to
-        its cue file."""
+        its cue file. If `cue_path` has a "mother" playlist set (see
+        set_playlist_parent), any track newly added here is ALSO (one-way
+        -- adding to the parent never adds back to this playlist)
+        propagated up to that parent, and the parent's own parent, and so
+        on -- so a "mother" playlist automatically stays a superset of
+        everything ever added to any of its "child" playlists."""
+        added = self._add_tracks_to_playlist_quiet(cue_path, paths)
         info = self.playlists.get(cue_path)
-        if info is None or not paths:
+        if info is None:
             return
-        added = 0
-        for path in paths:
-            if path not in info["tracks"]:
-                info["tracks"].append(path)
-                added += 1
-        if added:
-            write_cue_playlist(
-                cue_path, info["name"], info["tracks"], track_tags=self.track_tags)
-            self._populate_playlist_node(cue_path)
         noun = "track" if added == 1 else "tracks"
         if added:
             self.status_var.set(
@@ -1869,6 +1916,150 @@ class App:
         else:
             self.status_var.set(
                 f"Track(s) already in playlist '{info['name']}'")
+
+    def _add_tracks_to_playlist_quiet(self, cue_path, paths, _visited=None):
+        """Core logic behind add_tracks_to_playlist, minus the status
+        message -- used both for the direct call (which reports the
+        count back to the user) and to silently propagate newly added
+        tracks up a chain of "mother" playlists. `_visited` guards
+        against an (invalid, hand-edited) parent chain that loops back on
+        itself. Returns how many tracks were newly added to `cue_path`
+        itself."""
+        info = self.playlists.get(cue_path)
+        if info is None or not paths:
+            return 0
+        visited = _visited if _visited is not None else set()
+        if cue_path in visited:
+            return 0
+        visited.add(cue_path)
+
+        newly_added = [p for p in paths if p not in info["tracks"]]
+        if newly_added:
+            info["tracks"].extend(newly_added)
+            write_cue_playlist(
+                cue_path, info["name"], info["tracks"],
+                track_tags=self.track_tags, parent_path=info.get("parent"))
+            self._populate_playlist_node(cue_path)
+
+            parent_cue = info.get("parent")
+            if parent_cue and parent_cue in self.playlists:
+                self._add_tracks_to_playlist_quiet(
+                    parent_cue, newly_added, visited)
+
+        return len(newly_added)
+
+    def _playlist_ancestor_chain(self, cue_path):
+        """The chain of `cue_path`'s "mother" playlists, starting with
+        `cue_path` itself: [cue_path, its parent, its parent's parent,
+        ...]. Stops early if a cycle is detected (shouldn't normally
+        happen, but a hand-edited cue file could introduce one)."""
+        chain = []
+        current = cue_path
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            info = self.playlists.get(current)
+            current = info.get("parent") if info else None
+        return chain
+
+    def set_playlist_parent(self, cue_path):
+        """Open a small dialog to choose (or clear) `cue_path`'s "mother"
+        playlist: from then on, any track added to `cue_path` (the
+        "child") is ALSO added to the chosen mother playlist, one-way
+        (adding a track to the mother does NOT add it to this playlist).
+        Playlists that would create a cycle (this playlist's own
+        descendants, or itself) are excluded from the list."""
+        info = self.playlists.get(cue_path)
+        if info is None:
+            return
+
+        # Exclude anything that currently has `cue_path` in ITS ancestor
+        # chain (i.e. cue_path's descendants, plus cue_path itself) --
+        # picking one of those as cue_path's parent would create a cycle.
+        excluded = {
+            cp for cp in self.playlists
+            if cue_path in self._playlist_ancestor_chain(cp)
+        }
+        candidates = sorted(
+            ((cp, i["name"]) for cp, i in self.playlists.items()
+             if cp not in excluded),
+            key=lambda kv: kv[1].lower())
+
+        dialog = tk.Toplevel(self.root)
+        dialog.configure(bg=self.palette["bg"])
+        dialog.title(f"Set Mother Playlist - {info['name']}")
+        dialog.geometry("320x380")
+
+        ttk.Label(
+            dialog,
+            text=(f"Choose a \"mother\" playlist for '{info['name']}': any "
+                  "track added here will also be added to it (one-way -- "
+                  "the reverse never happens)."),
+            wraplength=300, justify=tk.LEFT,
+        ).pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
+
+        list_frame = ttk.Frame(dialog)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8)
+        listbox = tk.Listbox(
+            list_frame, exportselection=False,
+            bg=self.palette["field_bg"], fg=self.palette["field_fg"],
+            selectbackground=self.palette["select_bg"],
+            selectforeground=self.palette["select_fg"])
+        scroll = ttk.Scrollbar(
+            list_frame, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        listbox.insert(tk.END, "(None -- no mother playlist)")
+        for _cp, name in candidates:
+            listbox.insert(tk.END, name)
+
+        current_parent = info.get("parent")
+        selected_index = 0
+        for row, (cp, _name) in enumerate(candidates, start=1):
+            if cp == current_parent:
+                selected_index = row
+                break
+        listbox.selection_set(selected_index)
+        listbox.see(selected_index)
+
+        button_row = ttk.Frame(dialog, padding=8)
+        button_row.pack(side=tk.BOTTOM, fill=tk.X)
+
+        def on_ok():
+            selection = listbox.curselection()
+            if not selection:
+                dialog.destroy()
+                return
+            index = selection[0]
+            new_parent = None if index == 0 else candidates[index - 1][0]
+            self._apply_playlist_parent(cue_path, new_parent)
+            dialog.destroy()
+
+        ttk.Button(button_row, text="OK", command=on_ok).pack(
+            side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(button_row, text="Cancel",
+                   command=dialog.destroy).pack(side=tk.RIGHT)
+
+    def _apply_playlist_parent(self, cue_path, new_parent):
+        """Set (or clear, if `new_parent` is None) `cue_path`'s "mother"
+        playlist and persist it to its cue file."""
+        info = self.playlists.get(cue_path)
+        if info is None:
+            return
+        info["parent"] = new_parent
+        write_cue_playlist(
+            cue_path, info["name"], info["tracks"], track_tags=self.track_tags,
+            parent_path=new_parent)
+        if new_parent:
+            parent_name = self.playlists.get(new_parent, {}).get("name", "?")
+            self.status_var.set(
+                f"'{info['name']}' will now feed new tracks into '{parent_name}'")
+        else:
+            self.status_var.set(
+                f"Cleared mother playlist for '{info['name']}'")
 
     def remove_track_from_playlist(self, cue_path, item_id):
         info = self.playlists.get(cue_path)
@@ -1879,7 +2070,8 @@ class App:
         if real_path in info["tracks"]:
             info["tracks"].remove(real_path)
         write_cue_playlist(
-            cue_path, info["name"], info["tracks"], track_tags=self.track_tags)
+            cue_path, info["name"], info["tracks"], track_tags=self.track_tags,
+            parent_path=info.get("parent"))
         self._populate_playlist_node(cue_path)
         self.status_var.set(f"Removed track from playlist '{info['name']}'")
 
@@ -1894,16 +2086,25 @@ class App:
             return
         info["name"] = new_name.strip()
         write_cue_playlist(
-            cue_path, info["name"], info["tracks"], track_tags=self.track_tags)
+            cue_path, info["name"], info["tracks"], track_tags=self.track_tags,
+            parent_path=info.get("parent"))
         self.library_tree.item(info["node_id"], text=info["name"])
         self.status_var.set(f"Renamed playlist to '{info['name']}'")
 
     def remove_playlist(self, cue_path):
         """Remove the playlist from the library tree and delete its cue
-        file. Does NOT touch the audio files it referenced."""
+        file. Does NOT touch the audio files it referenced. Any OTHER
+        playlist that had this one set as its "mother" loses that link
+        (rather than being left pointing at a now-deleted cue file)."""
         info = self.playlists.pop(cue_path, None)
         if info is None:
             return
+        for other_cp, other_info in self.playlists.items():
+            if other_info.get("parent") == cue_path:
+                other_info["parent"] = None
+                write_cue_playlist(
+                    other_cp, other_info["name"], other_info["tracks"],
+                    track_tags=self.track_tags, parent_path=None)
         for item_id in [k for k, v in self._playlist_track_info.items()
                         if v[0] == cue_path]:
             del self._playlist_track_info[item_id]
@@ -2618,14 +2819,164 @@ class App:
     def _now_playing_text_widgets(self):
         return (self.now_title_label, self.now_artist_label)
 
+    # Supersampling factor for the disk rendering: everything (circle
+    # mask, rim, hole) is drawn at diameter * _DISK_SUPERSAMPLE, then
+    # downsampled to the real display size with LANCZOS. Drawing the
+    # circle directly at the small on-screen size (~72px) leaves visible
+    # jagged/mismatched edges between the mask, the rim stroke, and the
+    # square canvas corners -- rendering it oversized first and smoothly
+    # downsampling removes that ragged "outline" and gives a clean
+    # anti-aliased circle instead.
+    _DISK_SUPERSAMPLE = 4
+
+    def _build_disk_hires(self, art_pil):
+        """Build the un-rotated "spinning disk" rendering of `art_pil` at
+        supersampled resolution (a circle with a glossy white/silver rim
+        and a white-ringed center spindle hole, like a real pressed CD
+        label), painted onto a square canvas filled with the current
+        theme's background color so its corners blend invisibly into the
+        Now Playing bar behind it. Returns (hires_image, native_diameter).
+        The hole itself is filled with a color sampled from the art's own
+        corners (like a real CD label's print extending up to the hole),
+        not the app's theme background, so it doesn't look like a chunk
+        of the UI is missing."""
+        diameter = min(art_pil.size)
+        hi = diameter * self._DISK_SUPERSAMPLE
+        page_bg_color = self.palette["bg"]
+
+        art = art_pil.resize((hi, hi), Image.LANCZOS)
+        disk = Image.new("RGB", (hi, hi), color=page_bg_color)
+        mask = Image.new("L", (hi, hi), 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, hi - 1, hi - 1), fill=255)
+        disk.paste(art, (0, 0), mask)
+
+        # Sample the art's own background color (averaged from its four
+        # corners) to fill the center hole, so the hole reads as "part of
+        # the disk's label" rather than a cutout to the app's theme color.
+        corner_inset = max(1, hi // 30)
+        corners = [
+            art.getpixel((corner_inset, corner_inset)),
+            art.getpixel((hi - 1 - corner_inset, corner_inset)),
+            art.getpixel((corner_inset, hi - 1 - corner_inset)),
+            art.getpixel((hi - 1 - corner_inset, hi - 1 - corner_inset)),
+        ]
+        label_color = tuple(
+            round(sum(channel) / len(corners)) for channel in zip(*corners))
+
+        draw = ImageDraw.Draw(disk)
+        rim_width = max(2, hi // 30)
+        draw.ellipse(
+            (rim_width // 2, rim_width // 2,
+             hi - 1 - rim_width // 2, hi - 1 - rim_width // 2),
+            outline="#f2f2f2", width=rim_width)
+
+        hole_radius = max(3, hi // 9)
+        ring_width = max(2, hi // 45)
+        cx = cy = hi // 2
+        draw.ellipse(
+            (cx - hole_radius - ring_width, cy - hole_radius - ring_width,
+             cx + hole_radius + ring_width, cy + hole_radius + ring_width),
+            outline="#f2f2f2", width=ring_width)
+        draw.ellipse(
+            (cx - hole_radius, cy - hole_radius,
+             cx + hole_radius, cy + hole_radius),
+            fill=label_color)
+
+        return disk, diameter
+
+    def _disk_frame_from_hires(self, hires_image, diameter, angle=0):
+        """Rotate the supersampled `hires_image` by `angle` degrees (if
+        any) and downsample it to `diameter` for a single smooth,
+        anti-aliased on-screen disk frame.
+
+        A slight Gaussian blur is applied BEFORE the downsample: LANCZOS
+        (needed for a crisp result) rings/overshoots on very
+        high-contrast edges -- like the bright white rim against a dark
+        theme's near-black background -- which shows up as a faint dark
+        "outline" just outside the rim. Pre-blurring band-limits that
+        edge just enough to remove the ringing while still downsampling
+        to a crisp, clean circle (the blur radius is tiny relative to
+        the supersampled size, so it doesn't noticeably soften the art
+        or rim itself)."""
+        if angle:
+            hires_image = hires_image.rotate(
+                -angle, resample=Image.BICUBIC, fillcolor=self.palette["bg"])
+        blurred = hires_image.filter(
+            ImageFilter.GaussianBlur(radius=self._DISK_SUPERSAMPLE / 2))
+        return blurred.resize((diameter, diameter), Image.LANCZOS)
+
+    def _make_disk_image(self, art_pil, angle=0):
+        """One-off disk render (e.g. a single crossfade blend frame):
+        build + rotate + downsample in one call. For the continuously
+        spinning disk, _set_disk_base + _spin_disk_step cache the
+        supersampled base instead, to avoid rebuilding it from scratch
+        every frame."""
+        hires, diameter = self._build_disk_hires(art_pil)
+        return self._disk_frame_from_hires(hires, diameter, angle)
+
+    def _set_disk_base(self, art_pil):
+        """(Re)build the disk for a "settled" cover art (a new track, a
+        theme change, ...): caches both the supersampled un-rotated disk
+        (`_disk_hires_image`, reused every frame while spinning) and its
+        native-resolution angle-0 rendering (`_disk_base_image`, shown
+        while paused/stopped)."""
+        hires, diameter = self._build_disk_hires(art_pil)
+        self._disk_hires_image = hires
+        self._disk_base_image = self._disk_frame_from_hires(hires, diameter)
+
+    def _start_disk_spin(self):
+        """Begin (or resume) continuously rotating the Now Playing disk.
+        A no-op if it's already spinning."""
+        if self._disk_spin_job is not None or self._disk_hires_image is None:
+            return
+        self._spin_disk_step()
+
+    def _spin_disk_step(self):
+        if not (self.is_playing and not self.is_paused) or self._disk_hires_image is None:
+            self._disk_spin_job = None
+            return
+        # A small angle step at a high frame rate (rather than a big jump
+        # every 50ms) is what makes the rotation read as smooth motion
+        # instead of a visible stutter; the supersampled hi-res source
+        # keeps each rotated frame's edge anti-aliased too.
+        self._disk_angle = (self._disk_angle + 3) % 360
+        diameter = self._disk_base_image.size[0]
+        rotated = self._disk_frame_from_hires(
+            self._disk_hires_image, diameter, self._disk_angle)
+        photo = ImageTk.PhotoImage(rotated)
+        self.now_playing_art_image = photo
+        self.art_label.config(image=photo)
+        self._disk_spin_job = self.root.after(25, self._spin_disk_step)
+
+    def _stop_disk_spin(self):
+        """Freeze the disk at its current rotation (used when pausing/
+        stopping, and briefly during a track-change crossfade)."""
+        if self._disk_spin_job is not None:
+            self.root.after_cancel(self._disk_spin_job)
+            self._disk_spin_job = None
+
+    def _reset_disk_spin(self):
+        """Stop spinning and snap back to angle 0 -- used on Stop, so the
+        next Play starts from a clean, un-rotated disk."""
+        self._stop_disk_spin()
+        self._disk_angle = 0
+        if self._disk_base_image is not None:
+            photo = ImageTk.PhotoImage(self._disk_base_image)
+            self.now_playing_art_image = photo
+            self.art_label.config(image=photo)
+
     def _crossfade_art(self, new_art_pil, total_steps=8, step_ms=25):
         """Smoothly blend the Now Playing album art from whatever's
         currently shown to `new_art_pil` (a PIL Image), instead of
-        swapping it instantly."""
+        swapping it instantly. Each blended frame is rendered as a
+        circular "disk" (frozen at the current rotation) -- once the
+        blend finishes, the new track's disk becomes the spin base and
+        rotation resumes (if a track is actively playing)."""
         existing_job = self._art_crossfade_job
         if existing_job is not None:
             self.root.after_cancel(existing_job)
             self._art_crossfade_job = None
+        self._stop_disk_spin()
 
         old_art_pil = self._current_art_pil
         if old_art_pil is None or old_art_pil.size != new_art_pil.size:
@@ -2634,12 +2985,16 @@ class App:
         def step(i=0):
             ratio = (i + 1) / total_steps
             frame = Image.blend(old_art_pil, new_art_pil, ratio)
-            photo = ImageTk.PhotoImage(frame)
+            disk_frame = self._make_disk_image(frame, angle=self._disk_angle)
+            photo = ImageTk.PhotoImage(disk_frame)
             self.now_playing_art_image = photo
             self.art_label.config(image=photo)
             if i + 1 >= total_steps:
                 self._current_art_pil = new_art_pil
+                self._set_disk_base(new_art_pil)
                 self._art_crossfade_job = None
+                if self.is_playing and not self.is_paused:
+                    self._start_disk_spin()
             else:
                 self._art_crossfade_job = self.root.after(step_ms, step, i + 1)
 
@@ -2713,6 +3068,7 @@ class App:
             self.is_paused = False
             self.status_var.set(f"Playing: {self.now_title_var.get()}")
             self._update_play_pause_button()
+            self._start_disk_spin()
             self._tick_progress()
             return
 
@@ -2740,6 +3096,7 @@ class App:
         if self.progress_job is not None:
             self.root.after_cancel(self.progress_job)
             self.progress_job = None
+        self._stop_disk_spin()
         self.status_var.set(f"Paused: {self.now_title_var.get()}")
         self._update_play_pause_button()
 
@@ -2757,6 +3114,7 @@ class App:
         self.elapsed_before_pause = 0.0
         self._set_progress(0)
         self._highlight_now_playing_row(None)
+        self._reset_disk_spin()
         self.status_var.set("Stopped")
         self._update_play_pause_button()
 
@@ -2962,10 +3320,11 @@ class App:
         self.current_duration = get_track_duration(path)
         elapsed = max(0.0, min(elapsed, self.current_duration or elapsed))
 
-        art_image = get_track_art_image(path) or make_placeholder_art()
-        self.now_playing_art_image = art_image
         self._current_art_pil = get_track_art_pil(
             path) or make_placeholder_art_pil()
+        self._disk_angle = 0
+        self._set_disk_base(self._current_art_pil)
+        self.now_playing_art_image = ImageTk.PhotoImage(self._disk_base_image)
         self.art_label.config(image=self.now_playing_art_image)
 
         self.now_title_var.set(title)

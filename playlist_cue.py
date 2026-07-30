@@ -15,6 +15,7 @@ library.
 File layout written by `write_cue_playlist`:
 
     REM PLAYLIST_NAME "My Playlist"
+    REM PLAYLIST_PARENT "/absolute/path/to/mother_playlist.cue"
     FILE "/absolute/path/to/song1.mp3" MP3
       TRACK 01 AUDIO
         TITLE "Song Title"
@@ -24,6 +25,12 @@ File layout written by `write_cue_playlist`:
       TRACK 01 AUDIO
         TITLE "Another Song"
         INDEX 01 00:00:00
+
+The `REM PLAYLIST_PARENT` line is optional and only present when this
+playlist has a "mother" playlist set (see App.set_playlist_parent):
+any track added to THIS ("child") playlist is then also automatically
+added to the referenced parent playlist, one-way -- adding a track to
+the parent does NOT add it back to this playlist.
 
 Paths are stored ABSOLUTE (unlike a typical single-album cue sheet,
 which uses paths relative to the cue file, since all its audio normally
@@ -43,6 +50,7 @@ PLAYLISTS_DIR = os.path.join(CACHE_DIR, "playlists")
 
 _FILE_RE = re.compile(r'^FILE\s+"(.*)"\s+\S+\s*$')
 _REM_NAME_RE = re.compile(r'^REM\s+PLAYLIST_NAME\s+"(.*)"\s*$')
+_REM_PARENT_RE = re.compile(r'^REM\s+PLAYLIST_PARENT\s+"(.*)"\s*$')
 
 _FILE_TYPE_BY_EXT = {
     ".mp3": "MP3",
@@ -69,17 +77,23 @@ def _escape(value):
     return (value or "").replace('"', "'")
 
 
-def write_cue_playlist(cue_path, name, track_paths, track_tags=None):
+def write_cue_playlist(cue_path, name, track_paths, track_tags=None, parent_path=None):
     """Write `track_paths` (a list of absolute file paths, in order) to
     `cue_path` as a cue sheet. `name` is recorded in a leading
     `REM PLAYLIST_NAME "..."` comment so the display name survives even
-    if the file is renamed on disk. `track_tags` is an optional
-    {path: {"title", "artist", ...}} dict (the same shape App keeps in
-    `self.track_tags`) used to fill in TITLE/PERFORMER for readability in
-    other cue-aware software -- purely cosmetic, `read_cue_playlist` does
-    not read them back (the app always re-reads real audio tags itself)."""
+    if the file is renamed on disk. `parent_path`, if given, is this
+    playlist's "mother" playlist's cue file path, recorded in a
+    `REM PLAYLIST_PARENT "..."` comment (see the module docstring and
+    App.set_playlist_parent) -- omitted entirely when None. `track_tags`
+    is an optional {path: {"title", "artist", ...}} dict (the same shape
+    App keeps in `self.track_tags`) used to fill in TITLE/PERFORMER for
+    readability in other cue-aware software -- purely cosmetic,
+    `read_cue_playlist` does not read them back (the app always re-reads
+    real audio tags itself)."""
     track_tags = track_tags or {}
     lines = [f'REM PLAYLIST_NAME "{_escape(name)}"']
+    if parent_path:
+        lines.append(f'REM PLAYLIST_PARENT "{_escape(parent_path)}"')
     for path in track_paths:
         tags = track_tags.get(path, {})
         title = tags.get("title") or os.path.basename(path)
@@ -99,11 +113,15 @@ def write_cue_playlist(cue_path, name, track_paths, track_tags=None):
 
 
 def read_cue_playlist(cue_path):
-    """Parse `cue_path`, returning (name, [track_paths]). `name` falls
-    back to the cue file's basename (without extension) if no
-    `REM PLAYLIST_NAME` comment is present (e.g. a cue sheet written by
-    other software). Raises OSError if the file can't be read."""
+    """Parse `cue_path`, returning (name, [track_paths], parent_path).
+    `name` falls back to the cue file's basename (without extension) if
+    no `REM PLAYLIST_NAME` comment is present (e.g. a cue sheet written
+    by other software). `parent_path` is this playlist's "mother"
+    playlist's cue file path (see the module docstring), or None if it
+    doesn't have one / the line is absent. Raises OSError if the file
+    can't be read."""
     name = os.path.splitext(os.path.basename(cue_path))[0]
+    parent_path = None
     track_paths = []
     base_dir = os.path.dirname(cue_path)
 
@@ -116,6 +134,11 @@ def read_cue_playlist(cue_path):
                 name = name_match.group(1)
                 continue
 
+            parent_match = _REM_PARENT_RE.match(line)
+            if parent_match:
+                parent_path = parent_match.group(1) or None
+                continue
+
             file_match = _FILE_RE.match(line)
             if file_match:
                 path = file_match.group(1)
@@ -123,7 +146,7 @@ def read_cue_playlist(cue_path):
                     path = os.path.join(base_dir, path)
                 track_paths.append(os.path.normpath(path))
 
-    return name, track_paths
+    return name, track_paths, parent_path
 
 
 def unique_cue_path(name, directory=PLAYLISTS_DIR):
