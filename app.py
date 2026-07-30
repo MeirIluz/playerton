@@ -575,6 +575,17 @@ class App:
         palette = THEMES[self.theme_name]
         self.palette = palette
 
+        # Cancel any in-flight fade animation (now-playing title/artist,
+        # status bar, "Currently viewing folder" label, ...) BEFORE
+        # resetting their colors below -- each fade's step closure
+        # captured its start/end colors from the OLD theme, so leaving
+        # one running would keep repainting a stale in-between color
+        # over our reset for a few more steps (i.e. the exact "stuck on
+        # the old theme's color" bug this fixes).
+        for job in self._fade_jobs.values():
+            self.root.after_cancel(job)
+        self._fade_jobs.clear()
+
         style = ttk.Style()
         try:
             style.theme_use("clam")
@@ -628,6 +639,21 @@ class App:
             self.playlist_tree.tag_configure(
                 "ignored", foreground=self._grayscale_color(palette["field_fg"]),
                 background=self._grayscale_background(palette["field_bg"]))
+
+        # These labels get their `foreground` set directly (bypassing the
+        # ttk style) by the fade-in/fade-out animations above, which
+        # otherwise leaves a stale color override from the PREVIOUS theme
+        # in place after switching themes (a plain `style.configure(...)`
+        # can't override a per-widget option). Reset them to the new
+        # theme's real color explicitly.
+        if hasattr(self, "now_title_label"):
+            self.now_title_label.configure(foreground=palette["fg"])
+        if hasattr(self, "now_artist_label"):
+            self.now_artist_label.configure(foreground=palette["fg"])
+        if hasattr(self, "status_bar_label"):
+            self.status_bar_label.configure(foreground=palette["fg"])
+        if hasattr(self, "viewing_folder_label"):
+            self.viewing_folder_label.configure(foreground=palette["fg"])
 
         self.root.configure(bg=palette["bg"])
 
@@ -875,7 +901,8 @@ class App:
         row = self.queue_tree.identify_row(event.y)
         if not row:
             return
-        self.queue_tree.selection_set(row)
+        if row not in self.queue_tree.selection():
+            self.queue_tree.selection_set(row)
         index = int(row)
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
         menu.add_command(label="Play Now",
@@ -887,8 +914,21 @@ class App:
         menu.add_separator()
         menu.add_command(label="Remove from Queue",
                          command=self._remove_queue_selection)
+        menu.add_command(
+            label="Clear Selection",
+            command=self._clear_queue_selection,
+            state=tk.NORMAL if len(self.queue_tree.selection()) > 1 else tk.DISABLED)
         menu.add_command(label="Clear Queue", command=self._clear_queue)
         self._popup_menu(menu, event)
+
+    def _clear_queue_selection(self):
+        """Deselect whatever's currently multi-selected in the queue
+        panel, without touching the queue's actual contents (Escape does
+        the same thing for this and the other trees -- this is the
+        discoverable menu equivalent for the queue panel specifically)."""
+        selection = self.queue_tree.selection()
+        if selection:
+            self.queue_tree.selection_remove(*selection)
 
     def _on_queue_drag_start(self, event):
         row = self.queue_tree.identify_row(event.y)
@@ -1641,7 +1681,8 @@ class App:
           - a plain file: "View Containing Folder".
         ...on top of the shared Play/Queue/etc menu."""
         paths = self._collect_audio_paths(self.library_tree, item)
-        menu = self._build_context_menu(paths, paths, include_filters=False)
+        menu = self._build_context_menu(
+            paths, paths, include_filters=False, exclude_ignored_from_queue=True)
 
         folder_name = self._folder_like_label(self.library_tree, item)
         menu.insert_command(
@@ -1905,13 +1946,18 @@ class App:
         except Exception as exc:
             self.status_var.set(f"Could not open file manager: {exc}")
 
-    def _build_context_menu(self, primary_paths, selected_paths, include_filters=True):
+    def _build_context_menu(self, primary_paths, selected_paths, include_filters=True,
+                            exclude_ignored_from_queue=False):
         """Build the shared right-click dropdown menu for the given
         primary track(s) (what "Play"/"Go to Album" act on) and selected
         track(s) (what "Add to Queue"/"Remove"/"Ignore"/"Properties" act on).
         `include_filters=False` omits "Go to Album"/"More by Same Artist"
         (used for the library tree's folder nodes, where those filters
-        don't make sense)."""
+        don't make sense). `exclude_ignored_from_queue=True` (used for the
+        library tree, where "Add to Queue" may expand to a whole folder/
+        album/playlist's tracks) skips any ignored track rather than
+        queueing it -- ignored tracks are only ever queued when explicitly
+        selected directly in the playlist table itself."""
         primary_path = primary_paths[0] if primary_paths else None
 
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
@@ -1921,7 +1967,8 @@ class App:
                          command=self.context_shuffle_play)
         menu.add_command(
             label="Add to Queue",
-            command=lambda: self.context_add_to_queue(selected_paths))
+            command=lambda: self.context_add_to_queue(
+                selected_paths, exclude_ignored=exclude_ignored_from_queue))
         if include_filters:
             menu.add_separator()
             menu.add_command(
@@ -2185,20 +2232,39 @@ class App:
             return
         self._play_paths(paths)
 
-    def context_add_to_queue(self, paths):
+    def context_add_to_queue(self, paths, exclude_ignored=False):
+        """Queue `paths`. When `exclude_ignored` is True (used for the
+        library tree's folder/album/playlist "Add to Queue", which
+        expands to every descendant track), any ignored track is skipped
+        rather than queued -- ignored tracks are only ever queued when
+        explicitly selected directly in the playlist table itself
+        (single or multi-select), where `exclude_ignored` stays False."""
+        if exclude_ignored:
+            skipped = sum(1 for p in paths if p in self.player.ignored)
+            paths = [p for p in paths if p not in self.player.ignored]
+        else:
+            skipped = 0
+        if not paths:
+            if skipped:
+                self.status_var.set(
+                    f"All {skipped} track(s) are ignored, none added to queue")
+            return
         self.player.queue.extend(paths)
         self._refresh_queue_view()
-        self.status_var.set(f"Added {len(paths)} track(s) to queue")
+        suffix = f" ({skipped} ignored track(s) skipped)" if skipped else ""
+        self.status_var.set(f"Added {len(paths)} track(s) to queue{suffix}")
 
     def on_add_selection_to_queue(self):
         """Handler for the Now Playing bar's "Add to Queue" button: queues
-        whatever is currently selected in the playlist."""
-        selection = list(self.playlist_tree.selection())
-        if not selection:
-            self.status_var.set(
-                "Select track(s) in the playlist to add to the queue")
+        the track CURRENTLY PLAYING (this button lives among the other
+        Now Playing transport controls -- Play/Pause/Stop/Shuffle/Repeat
+        -- which all act on the active track, not on the playlist
+        table's selection)."""
+        path = self._current_playing_path()
+        if path is None:
+            self.status_var.set("No track is currently playing")
             return
-        self.context_add_to_queue(selection)
+        self.context_add_to_queue([path])
 
     def context_remove_from_playlist(self, paths):
         for path in paths:

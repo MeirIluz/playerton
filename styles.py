@@ -144,6 +144,25 @@ SUNSET_THEME = {
     "queue_fg": "#123047",
 }
 
+# DOOM-inspired theme: near-black metal/UAC gray backdrop with blood-red
+# accents and a fire-orange highlight for the currently-playing track
+# (evoking the series' iconic black/red UI and lava/fire palette).
+DOOM_THEME = {
+    "bg": "#0d0505",
+    "fg": "#e02020",
+    "field_bg": "#140707",
+    "field_fg": "#d8b8b8",
+    "select_bg": "#8a0303",
+    "select_fg": "#ffffff",
+    "button_bg": "#2a1010",
+    "button_fg": "#e02020",
+    "trough_bg": "#1a0a0a",
+    "highlight_bg": "#c41e1e",
+    "highlight_fg": "#000000",
+    "queue_bg": "#4a1414",
+    "queue_fg": "#ffb347",
+}
+
 # Maps a theme name -> its palette dict; drives the View > Theme menu
 # (one radiobutton per entry, in this order) and every color lookup in
 # STYLESHEET below. Add a new theme by adding an entry here.
@@ -152,6 +171,7 @@ THEMES = {
     "dark": DARK_THEME,
     "dark_blue": DARK_BLUE_THEME,
     "sunset": SUNSET_THEME,
+    "doom": DOOM_THEME,
 }
 
 # Every key a theme dict must define (used only for validation/reference;
