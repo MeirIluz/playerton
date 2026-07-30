@@ -302,6 +302,15 @@ STYLESHEET = {
         "relief": "sunken",
         "padding": (4, 2),
     },
+    "ViewingFolder.TLabel": {
+        # The transient "Currently viewing folder: ..." label shown
+        # above the playlist table, which fades out a couple seconds
+        # after appearing (see App._show_viewing_folder_label).
+        "background": "bg",
+        "foreground": "fg",
+        "font": FONTS["small"],
+        "padding": (4, 2),
+    },
     "Library.Treeview": {
         "font": FONTS["base"],
         "rowheight": 20,

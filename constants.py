@@ -33,6 +33,10 @@ COMMON_TAG_FIELDS = [
     ("bpm", "BPM"),
 ]
 
+# Tag fields whose Properties/Bulk Edit entry box should only accept
+# digits, auto-rejecting any other typed character.
+NUMERIC_TAG_FIELDS = {"date", "tracknumber", "discnumber", "bpm"}
+
 MIXED_SENTINEL = "(mixed)"
 
 # All metadata columns selectable for the playlist table (Artist/Title/...),

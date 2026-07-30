@@ -22,7 +22,7 @@ import pygame
 
 from constants import (
     MUSIC_EXTENSIONS, MUSIC_FILETYPES, IMAGE_FILETYPES,
-    COMMON_TAG_FIELDS, MIXED_SENTINEL,
+    COMMON_TAG_FIELDS, NUMERIC_TAG_FIELDS, MIXED_SENTINEL,
     PLAYLIST_COLUMNS, DEFAULT_PLAYLIST_COLUMNS, PLAYLIST_COLUMN_WIDTHS,
 )
 from logging_setup import logger
@@ -45,6 +45,13 @@ class App:
         self.player = Player()
         self.track_tags = {}  # path -> {"artist", "title", "album", "duration"}
         self.current_filter = None  # ("album" | "artist", value) or None
+        self.search_query = ""  # lowercased search box text; "" = no search filter
+
+        # Shared validation for the Track #/Disc #/Year/BPM tag entry
+        # boxes (Properties/Bulk Edit dialogs): only ever let digits
+        # through as the user types, formatting the value automatically.
+        self._numeric_validate_cmd = (
+            self.root.register(self._validate_numeric_input), "%d", "%P")
 
         try:
             pygame.mixer.init()
@@ -131,6 +138,7 @@ class App:
 
         self._build_menu()
         self._build_toolbar()
+        self._build_search_bar()
         self._build_status_bar()
         self._build_now_playing_bar()
         self._build_body()
@@ -235,6 +243,44 @@ class App:
         volume = ttk.Scale(toolbar, from_=0, to=100, variable=self.volume_var,
                            orient=tk.HORIZONTAL, length=100, command=self.on_volume_change)
         volume.pack(side=tk.LEFT, padx=2)
+
+    # -- search bar (filters the library tree + playlist table) ----------
+    def _build_search_bar(self):
+        search_frame = ttk.Frame(self.root, padding=(4, 2))
+        search_frame.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(search_frame, text="Search:", style="ToolbarLabel.TLabel").pack(
+            side=tk.LEFT, padx=(0, 4))
+        self.search_var = tk.StringVar(value="")
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            search_frame, text="Clear", style="PanelAction.TButton",
+            command=lambda: self.search_var.set("")).pack(side=tk.LEFT, padx=(4, 0))
+        self.search_var.trace_add("write", self._on_search_changed)
+
+    def _on_search_changed(self, *_args):
+        self.search_query = self.search_var.get().strip().lower()
+        self._refresh_playlist_view()
+        if not self.search_query:
+            self._clear_library_highlight()
+            self.status_var.set("Ready")
+            return
+        matched_paths = [
+            p for p in self.player.playlist if self._matches_search(p)]
+        self._highlight_library_folders(matched_paths)
+        noun = "match" if len(matched_paths) == 1 else "matches"
+        self.status_var.set(
+            f"Search '{self.search_query}': {len(matched_paths)} {noun}")
+
+    def _matches_search(self, path):
+        if not self.search_query:
+            return True
+        tags = self.track_tags.get(path, {})
+        haystack = " ".join([
+            tags.get("artist", ""), tags.get("title", ""),
+            tags.get("album", ""), os.path.basename(path),
+        ]).lower()
+        return self.search_query in haystack
 
     # -- now playing bar --------------------------------------------------
     def _build_now_playing_bar(self):
@@ -347,6 +393,35 @@ class App:
     def _rgb_of(self, color):
         r, g, b = self.root.winfo_rgb(color)
         return (r >> 8, g >> 8, b >> 8)
+
+    def _show_viewing_folder_label(self, name):
+        """Show "Currently viewing folder: <name>" above the playlist
+        table, then automatically fade it out a couple seconds later
+        (fading the text color to the background color rather than
+        actual widget transparency, since plain ttk labels don't support
+        per-widget alpha)."""
+        if self._viewing_folder_fade_job is not None:
+            self.root.after_cancel(self._viewing_folder_fade_job)
+            self._viewing_folder_fade_job = None
+        self.viewing_folder_var.set(f"Currently viewing folder: {name}")
+        self.viewing_folder_label.configure(foreground=self.palette["fg"])
+        self._viewing_folder_fade_job = self.root.after(
+            2000, self._fade_viewing_folder_label, 0)
+
+    def _fade_viewing_folder_label(self, step, total_steps=12, step_ms=30):
+        if step >= total_steps:
+            self.viewing_folder_var.set("")
+            self._viewing_folder_fade_job = None
+            return
+        ratio = (step + 1) / total_steps
+        fg_rgb = self._rgb_of(self.palette["fg"])
+        bg_rgb = self._rgb_of(self.palette["bg"])
+        blended = tuple(
+            round(fg + (bg - fg) * ratio) for fg, bg in zip(fg_rgb, bg_rgb))
+        self.viewing_folder_label.configure(
+            foreground="#%02x%02x%02x" % blended)
+        self._viewing_folder_fade_job = self.root.after(
+            step_ms, self._fade_viewing_folder_label, step + 1, total_steps, step_ms)
 
     def _on_right_box_right_click(self, event):
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
@@ -512,8 +587,8 @@ class App:
         lib_scroll = ttk.Scrollbar(
             library_tree_frame, orient=tk.VERTICAL, command=self.library_tree.yview)
         self.library_tree.configure(yscrollcommand=lib_scroll.set)
-        self.library_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         lib_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.library_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         library_pane.add(library_tree_frame, weight=2)
 
         # A permanent "Playlists" node (always first/top) holding every
@@ -549,6 +624,17 @@ class App:
                    command=self._clear_playlist_background).pack(
             side=tk.RIGHT, padx=2, pady=2)
 
+        # Transient "Currently viewing folder: ..." label, shown briefly
+        # above the playlist table whenever a folder/playlist is opened
+        # from the library tree, then automatically faded out -- see
+        # _show_viewing_folder_label.
+        self.viewing_folder_var = tk.StringVar(value="")
+        self.viewing_folder_label = ttk.Label(
+            playlist_frame, textvariable=self.viewing_folder_var,
+            style="ViewingFolder.TLabel")
+        self.viewing_folder_label.pack(side=tk.TOP, fill=tk.X)
+        self._viewing_folder_fade_job = None
+
         playlist_body = ttk.Frame(playlist_frame)
         playlist_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -558,14 +644,18 @@ class App:
         pl_scroll = ttk.Scrollbar(
             playlist_body, orient=tk.VERTICAL, command=self.playlist_tree.yview)
         self.playlist_tree.configure(yscrollcommand=pl_scroll.set)
-        self.playlist_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         pl_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.playlist_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         body.add(playlist_frame, weight=3)
 
         self.playlist_tree.bind("<Double-1>", self._on_tree_double_click)
         self.playlist_tree.bind("<Button-3>", self._on_tree_right_click)
         self.playlist_tree.bind(
             "<Configure>", self._on_playlist_tree_configure)
+        self.playlist_tree.bind(
+            "<ButtonRelease-1>", self._on_playlist_single_click, add="+")
+        self.playlist_tree.bind(
+            "<Button-1>", self._on_playlist_heading_click, add="+")
 
         # Drag-and-drop tracks onto a playlist node in the library tree,
         # from either the playlist table or the library tree itself.
@@ -1063,6 +1153,8 @@ class App:
         return tuple(tags.get(key, "") for key in self.playlist_tree["columns"])
 
     def _track_passes_filter(self, path):
+        if not self._matches_search(path):
+            return False
         if self.current_filter is None:
             return True
         kind, value = self.current_filter
@@ -1293,14 +1385,42 @@ class App:
         tree = event.widget
         if (tree is self.playlist_tree
                 and tree.identify_region(event.x, event.y) == "heading"):
-            self._on_playlist_heading_double_click(event)
+            # Heading clicks are handled on a single click now (see
+            # _on_playlist_heading_click); nothing extra to do here.
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            return
+        if (tree is self.library_tree and tree.get_children(item)
+                and os.path.isdir(item)):
+            self._show_viewing_folder_label(tree.item(item, "text") or item)
+        self._play_paths(self._collect_audio_paths(tree, item))
+
+    def _on_playlist_single_click(self, event):
+        """A single left-click on a playlist row plays it (rather than
+        requiring a double-click). Shift/Ctrl-clicks are left alone so
+        extending the selection for multi-track actions (queueing,
+        removing, bulk edit, ...) still works normally, and a click that
+        was actually the end of a drag-onto-a-playlist gesture (released
+        over the library tree) doesn't also start playback."""
+        if event.state & 0x0005:  # Shift (0x0001) or Control (0x0004)
+            return
+        tree = event.widget
+        if tree.identify_region(event.x, event.y) == "heading":
+            return
+        target = self.root.winfo_containing(event.x_root, event.y_root)
+        if target is self.library_tree:
             return
         item = tree.identify_row(event.y)
         if not item:
             return
         self._play_paths(self._collect_audio_paths(tree, item))
 
-    def _on_playlist_heading_double_click(self, event):
+    def _on_playlist_heading_click(self, event):
+        """A single left-click on a playlist column header sorts by that
+        column (was previously a double-click)."""
+        if self.playlist_tree.identify_region(event.x, event.y) != "heading":
+            return
         column_id = self.playlist_tree.identify_column(event.x)
         if not column_id:
             return
@@ -1384,9 +1504,12 @@ class App:
         paths = self._collect_audio_paths(self.library_tree, item)
         menu = self._build_context_menu(paths, paths, include_filters=False)
 
+        folder_name = (
+            self.library_tree.item(item, "text") or item
+        ) if os.path.isdir(item) else None
         menu.insert_command(
             0, label="View", state=tk.NORMAL if paths else tk.DISABLED,
-            command=lambda: self._view_folder(paths))
+            command=lambda: self._view_folder(paths, folder_name))
 
         # A playlist ROOT node's iid is "playlist::<cue_path>"; look it up
         # via its stored node_id rather than treating `item` as a cue_path.
@@ -1614,7 +1737,7 @@ class App:
             pass
         self.status_var.set(f"Removed playlist '{info['name']}'")
 
-    def _view_folder(self, paths):
+    def _view_folder(self, paths, folder_name=None):
         """Show `paths` in the playlist table on the right (same filtering
         that playing them would apply), WITHOUT starting playback --
         lets you browse a folder/album's tracklist without interrupting
@@ -1624,6 +1747,8 @@ class App:
             return
         self.current_filter = ("paths", frozenset(paths))
         self._refresh_playlist_view()
+        if folder_name:
+            self._show_viewing_folder_label(folder_name)
         self.status_var.set(f"Viewing {len(paths)} track(s)")
 
     def _open_in_file_manager(self, dirpath):
@@ -1883,6 +2008,22 @@ class App:
         self.player.ignored.update(paths)
         self.status_var.set(f"Ignored {len(paths)} track(s)")
 
+    def _validate_numeric_input(self, action, proposed):
+        """`validatecommand` for the Track #/Disc #/Year/BPM entry boxes:
+        always allow deletions (action "0"), but only let insertions
+        through if the resulting text is empty or all digits -- this is
+        what auto-formats those fields to numbers-only as you type."""
+        if action == "0":
+            return True
+        return proposed == "" or proposed.isdigit()
+
+    def _make_tag_entry(self, parent, key, var, width):
+        if key in NUMERIC_TAG_FIELDS:
+            return ttk.Entry(
+                parent, textvariable=var, width=width,
+                validate="key", validatecommand=self._numeric_validate_cmd)
+        return ttk.Entry(parent, textvariable=var, width=width)
+
     def show_properties(self, path=None):
         if path is None:
             selection = self.playlist_tree.selection()
@@ -1905,7 +2046,7 @@ class App:
             ttk.Label(edit_frame, text=label, width=14, anchor=tk.W).grid(
                 row=row, column=0, sticky=tk.W, pady=2)
             var = tk.StringVar(value=common.get(key, ""))
-            ttk.Entry(edit_frame, textvariable=var, width=40).grid(
+            self._make_tag_entry(edit_frame, key, var, 40).grid(
                 row=row, column=1, sticky=tk.EW, pady=2)
             entries[key] = var
         edit_frame.columnconfigure(1, weight=1)
@@ -1991,7 +2132,7 @@ class App:
             ttk.Label(edit_frame, text=label, width=14, anchor=tk.W).grid(
                 row=row, column=0, sticky=tk.W, pady=2)
             var = tk.StringVar(value=common_values[key])
-            ttk.Entry(edit_frame, textvariable=var, width=30).grid(
+            self._make_tag_entry(edit_frame, key, var, 30).grid(
                 row=row, column=1, sticky=tk.EW, pady=2)
             entries[key] = var
         edit_frame.columnconfigure(1, weight=1)
