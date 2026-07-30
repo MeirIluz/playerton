@@ -28,7 +28,8 @@ from constants import (
 from logging_setup import logger
 from audio_tags import (
     format_duration, read_track_tags, get_track_duration,
-    make_placeholder_art, get_track_art_image, read_full_metadata,
+    make_placeholder_art, make_placeholder_art_pil,
+    get_track_art_image, get_track_art_pil, read_full_metadata,
     read_common_tags, apply_common_tags,
 )
 from image_utils import fit_image_cover, apply_low_opacity
@@ -82,6 +83,17 @@ class App:
         # where the active "Go to Album"/"More by Same Artist" filter's
         # tracks live; cleared/reapplied each time the filter changes.
         self._library_highlighted_items = []
+
+        # Per-widget scheduled `.after()` fade job ids, keyed by widget,
+        # for every smooth color-fade animation in the app (status bar,
+        # "Currently viewing folder" label, now-playing row highlight,
+        # library filter-match highlight, ...) -- see _animate_color_fade.
+        self._fade_jobs = {}
+        # The current cover art shown in the Now Playing bar, as a raw
+        # PIL Image (kept alongside the PhotoImage so the next track
+        # change can crossfade FROM it) -- see _play_track/_crossfade_art.
+        self._current_art_pil = None
+        self._art_crossfade_job = None
 
         # Index being dragged in the queue panel, for click-and-drag
         # reordering (session-only UI state).
@@ -145,6 +157,11 @@ class App:
         self._apply_theme()
         self._restore_from_cache()
 
+        # Escape clears whichever tree currently has a multi-selection
+        # (playlist table, library tree, or queue panel) -- a quick way
+        # to back out of a multi-track selection without clicking away.
+        self.root.bind_all("<Escape>", self._on_escape_clear_selection)
+
     # -- menu bar ---------------------------------------------------
     def _build_menu(self):
         menu_bar = tk.Menu(self.root)
@@ -161,6 +178,8 @@ class App:
             label="New Playlist...", command=lambda: self.create_playlist())
         file_menu.add_command(
             label="Import Cue Playlist...", command=self.import_cue_playlist)
+        file_menu.add_separator()
+        file_menu.add_command(label="Refresh App", command=self._relaunch_app)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
         menu_bar.add_cascade(label="File", menu=file_menu)
@@ -288,6 +307,7 @@ class App:
         frame.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.now_playing_art_image = make_placeholder_art()
+        self._current_art_pil = make_placeholder_art_pil()
         self.art_label = tk.Label(frame, image=self.now_playing_art_image)
         self.art_label.pack(side=tk.LEFT, padx=(0, 10))
 
@@ -298,10 +318,14 @@ class App:
 
         self.now_title_var = tk.StringVar(value="No track playing")
         self.now_artist_var = tk.StringVar(value="")
-        ttk.Label(info_frame, textvariable=self.now_title_var,
-                  style="NowPlayingTitle.TLabel").pack(anchor=tk.W)
-        ttk.Label(info_frame, textvariable=self.now_artist_var,
-                  style="NowPlayingArtist.TLabel").pack(anchor=tk.W)
+        self.now_title_label = ttk.Label(
+            info_frame, textvariable=self.now_title_var,
+            style="NowPlayingTitle.TLabel")
+        self.now_title_label.pack(anchor=tk.W)
+        self.now_artist_label = ttk.Label(
+            info_frame, textvariable=self.now_artist_var,
+            style="NowPlayingArtist.TLabel")
+        self.now_artist_label.pack(anchor=tk.W)
 
         controls_row = ttk.Frame(info_frame)
         controls_row.pack(fill=tk.X, pady=(4, 0))
@@ -394,34 +418,84 @@ class App:
         r, g, b = self.root.winfo_rgb(color)
         return (r >> 8, g >> 8, b >> 8)
 
+    def _grayscale_color(self, color):
+        """Desaturate `color` to a mid-gray of the same perceived
+        brightness -- used for the "ignored" track marker so it looks
+        grayed-out regardless of the active theme's colors."""
+        r, g, b = self._rgb_of(color)
+        gray = round(0.299 * r + 0.587 * g + 0.114 * b)
+        return "#%02x%02x%02x" % (gray, gray, gray)
+
+    def _grayscale_background(self, color, amount=0.3):
+        """Tint `color` (a background) toward a FIXED mid-gray (not one
+        matched to `color`'s own brightness -- that would be a no-op for
+        themes whose background is already near-neutral, e.g. the dark
+        theme's #1e1e1e), for a visibly grayed-out row background on
+        ignored tracks, on top of the dimmed text from _grayscale_color."""
+        r, g, b = self._rgb_of(color)
+        blended = self._blend_rgb((r, g, b), (128, 128, 128), amount)
+        return "#%02x%02x%02x" % blended
+
+    @staticmethod
+    def _blend_rgb(start_rgb, end_rgb, ratio):
+        return tuple(
+            round(start + (end - start) * ratio)
+            for start, end in zip(start_rgb, end_rgb))
+
+    # -- generic smooth color-fade animation helper -----------------------
+    # Powers every fade effect in the app (status bar messages, the
+    # "Currently viewing folder" label, the now-playing row highlight,
+    # the library filter-match highlight, ...): animates a widget's color
+    # from `start_color` to `end_color` over `total_steps` steps, then
+    # calls `on_complete` (if given). Any fade already running for the
+    # same `key` is cancelled first, so rapid updates always restart
+    # cleanly from full color instead of stacking/racing.
+    def _animate_color_fade(self, key, apply_color, start_color, end_color,
+                            delay_ms=0, total_steps=14, step_ms=30, on_complete=None):
+        existing = self._fade_jobs.pop(key, None)
+        if existing is not None:
+            self.root.after_cancel(existing)
+        start_rgb = self._rgb_of(start_color)
+        end_rgb = self._rgb_of(end_color)
+        apply_color(start_color)
+        job = self.root.after(
+            delay_ms, self._step_color_fade, key, apply_color,
+            start_rgb, end_rgb, 0, total_steps, step_ms, on_complete)
+        self._fade_jobs[key] = job
+
+    def _step_color_fade(self, key, apply_color, start_rgb, end_rgb, step,
+                         total_steps, step_ms, on_complete):
+        if step >= total_steps:
+            self._fade_jobs.pop(key, None)
+            if on_complete:
+                on_complete()
+            return
+        ratio = (step + 1) / total_steps
+        blended = self._blend_rgb(start_rgb, end_rgb, ratio)
+        try:
+            apply_color("#%02x%02x%02x" % blended)
+        except tk.TclError:
+            self._fade_jobs.pop(key, None)
+            return
+        job = self.root.after(
+            step_ms, self._step_color_fade, key, apply_color,
+            start_rgb, end_rgb, step + 1, total_steps, step_ms, on_complete)
+        self._fade_jobs[key] = job
+
     def _show_viewing_folder_label(self, name):
         """Show "Currently viewing folder: <name>" above the playlist
         table, then automatically fade it out a couple seconds later
         (fading the text color to the background color rather than
         actual widget transparency, since plain ttk labels don't support
         per-widget alpha)."""
-        if self._viewing_folder_fade_job is not None:
-            self.root.after_cancel(self._viewing_folder_fade_job)
-            self._viewing_folder_fade_job = None
         self.viewing_folder_var.set(f"Currently viewing folder: {name}")
-        self.viewing_folder_label.configure(foreground=self.palette["fg"])
-        self._viewing_folder_fade_job = self.root.after(
-            2000, self._fade_viewing_folder_label, 0)
-
-    def _fade_viewing_folder_label(self, step, total_steps=12, step_ms=30):
-        if step >= total_steps:
-            self.viewing_folder_var.set("")
-            self._viewing_folder_fade_job = None
-            return
-        ratio = (step + 1) / total_steps
-        fg_rgb = self._rgb_of(self.palette["fg"])
-        bg_rgb = self._rgb_of(self.palette["bg"])
-        blended = tuple(
-            round(fg + (bg - fg) * ratio) for fg, bg in zip(fg_rgb, bg_rgb))
-        self.viewing_folder_label.configure(
-            foreground="#%02x%02x%02x" % blended)
-        self._viewing_folder_fade_job = self.root.after(
-            step_ms, self._fade_viewing_folder_label, step + 1, total_steps, step_ms)
+        self._animate_color_fade(
+            self.viewing_folder_label,
+            lambda color: self.viewing_folder_label.configure(
+                foreground=color),
+            self.palette["fg"], self.palette["bg"],
+            delay_ms=2000,
+            on_complete=lambda: self.viewing_folder_var.set(""))
 
     def _on_right_box_right_click(self, event):
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
@@ -534,12 +608,16 @@ class App:
             self.library_tree.tag_configure(
                 "filter_match", background=palette["highlight_bg"],
                 foreground=palette["highlight_fg"])
+            self.library_tree.tag_configure(
+                "ignored", foreground=self._grayscale_color(palette["fg"]),
+                background=self._grayscale_background(palette["bg"]))
 
         # Same contrasting highlight for the currently-playing track's row
         # in the playlist table, when it's visible in the current view.
         # "in_queue" gets its own subtler color so a queued-but-not-yet-
         # playing track is still distinguishable from the actively
-        # playing one.
+        # playing one. "ignored" grays out a track skipped by automatic
+        # next/previous (see context_toggle_ignore).
         if hasattr(self, "playlist_tree"):
             self.playlist_tree.tag_configure(
                 "now_playing", background=palette["highlight_bg"],
@@ -547,6 +625,9 @@ class App:
             self.playlist_tree.tag_configure(
                 "in_queue", background=palette["queue_bg"],
                 foreground=palette["queue_fg"])
+            self.playlist_tree.tag_configure(
+                "ignored", foreground=self._grayscale_color(palette["field_fg"]),
+                background=self._grayscale_background(palette["field_bg"]))
 
         self.root.configure(bg=palette["bg"])
 
@@ -633,7 +714,6 @@ class App:
             playlist_frame, textvariable=self.viewing_folder_var,
             style="ViewingFolder.TLabel")
         self.viewing_folder_label.pack(side=tk.TOP, fill=tk.X)
-        self._viewing_folder_fade_job = None
 
         playlist_body = ttk.Frame(playlist_frame)
         playlist_body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -652,8 +732,6 @@ class App:
         self.playlist_tree.bind("<Button-3>", self._on_tree_right_click)
         self.playlist_tree.bind(
             "<Configure>", self._on_playlist_tree_configure)
-        self.playlist_tree.bind(
-            "<ButtonRelease-1>", self._on_playlist_single_click, add="+")
         self.playlist_tree.bind(
             "<Button-1>", self._on_playlist_heading_click, add="+")
 
@@ -728,18 +806,20 @@ class App:
         """Add/remove the "in_queue" tag on the playlist table's rows to
         match the current contents of `self.player.queue`, without doing a
         full `_refresh_playlist_view()` (which would also re-sort/re-filter
-        and be overkill for just a queue change)."""
+        and be overkill for just a queue change). Preserves "now_playing"/
+        "ignored" if either was already set on a row."""
         if not hasattr(self, "playlist_tree"):
             return
         queued_paths = set(self.player.queue)
         for item in self.playlist_tree.get_children():
-            is_now_playing = "now_playing" in self.playlist_tree.item(
-                item, "tags")
+            current_tags = self.playlist_tree.item(item, "tags")
             new_tags = []
-            if is_now_playing:
+            if "now_playing" in current_tags:
                 new_tags.append("now_playing")
             if item in queued_paths:
                 new_tags.append("in_queue")
+            if "ignored" in current_tags:
+                new_tags.append("ignored")
             self.playlist_tree.item(item, tags=tuple(new_tags))
 
     def _selected_queue_index(self):
@@ -944,10 +1024,21 @@ class App:
     # -- status bar -----------------------------------------------------
     def _build_status_bar(self):
         self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(
+        self.status_bar_label = ttk.Label(
             self.root, textvariable=self.status_var, anchor=tk.W,
             style="StatusBar.TLabel")
-        status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_bar_label.pack(side=tk.BOTTOM, fill=tk.X)
+        # Every status_var.set(...) call anywhere in the app automatically
+        # gets this fade-to-background animation, so no individual call
+        # site needs to know about it.
+        self.status_var.trace_add("write", self._on_status_changed)
+
+    def _on_status_changed(self, *_args):
+        self._animate_color_fade(
+            self.status_bar_label,
+            lambda color: self.status_bar_label.configure(foreground=color),
+            self.palette["fg"], self.palette["bg"],
+            delay_ms=2500, total_steps=20, step_ms=40)
 
     # -- file/folder actions ---------------------------------------------
     def open_files(self):
@@ -1004,6 +1095,7 @@ class App:
                 self.library_tree.insert(
                     parent_id, tk.END, iid=entry.path, text=entry.name, open=False)
                 self._add_track(entry.path)
+                self._apply_library_ignored_mark(entry.path)
                 added += 1
 
         return added
@@ -1127,7 +1219,8 @@ class App:
                 self._refresh_playlist_view()
             else:
                 self.playlist_tree.insert(
-                    "", tk.END, iid=path, values=self._row_values(path))
+                    "", tk.END, iid=path, values=self._row_values(path),
+                    tags=self._row_tags(path))
 
     def _read_all_track_tags(self, path):
         """Read every metadata field the playlist table can show for
@@ -1150,7 +1243,28 @@ class App:
 
     def _row_values(self, path):
         tags = self.track_tags.get(path, {})
-        return tuple(tags.get(key, "") for key in self.playlist_tree["columns"])
+        values = []
+        for key in self.playlist_tree["columns"]:
+            value = tags.get(key, "")
+            if key == "title" and path in self.player.ignored:
+                value = f"\u2717 {value}" if value else "\u2717"
+            values.append(value)
+        return tuple(values)
+
+    def _row_tags(self, path):
+        """The full set of display tags for `path`'s playlist row: which
+        of "now_playing"/"in_queue"/"ignored" currently apply. Listed in
+        this priority order (now_playing first) since ttk resolves a
+        conflicting style option -- e.g. foreground -- from whichever tag
+        appears FIRST in the row's tags tuple."""
+        tags = []
+        if path == self._current_playing_path():
+            tags.append("now_playing")
+        if path in self.player.queue:
+            tags.append("in_queue")
+        if path in self.player.ignored:
+            tags.append("ignored")
+        return tuple(tags)
 
     def _track_passes_filter(self, path):
         if not self._matches_search(path):
@@ -1167,16 +1281,10 @@ class App:
         self.playlist_tree.delete(*self.playlist_tree.get_children())
         paths = [
             p for p in self.player.playlist if self._track_passes_filter(p)]
-        now_playing_path = self._current_playing_path()
-        queued_paths = set(self.player.queue)
         for path in self._sorted_paths(paths):
-            tags = []
-            if path == now_playing_path:
-                tags.append("now_playing")
-            if path in queued_paths:
-                tags.append("in_queue")
             self.playlist_tree.insert(
-                "", tk.END, iid=path, values=self._row_values(path), tags=tuple(tags))
+                "", tk.END, iid=path, values=self._row_values(path),
+                tags=self._row_tags(path))
 
     def _current_playing_path(self):
         index = self.player.current_index
@@ -1189,17 +1297,30 @@ class App:
         highlight if it's currently visible in the table (i.e. not
         filtered out by the active view/filter). Any other row is cleared
         of the "now_playing" tag first (since only one track can be "now
-        playing" at a time), while preserving its "in_queue" tag if it
-        has one. "now_playing" is listed first so it takes priority over
-        "in_queue" for styling if a row somehow has both."""
+        playing" at a time), while preserving its "in_queue"/"ignored"
+        tags if it has them. "now_playing" is listed first so it takes
+        priority over the others for styling if a row has more than one.
+        The highlight's background fades smoothly in rather than
+        appearing instantly."""
         for item in self.playlist_tree.get_children():
-            in_queue = "in_queue" in self.playlist_tree.item(item, "tags")
+            current_tags = self.playlist_tree.item(item, "tags")
             new_tags = []
             if item == path:
                 new_tags.append("now_playing")
-            if in_queue:
+            if "in_queue" in current_tags:
                 new_tags.append("in_queue")
+            if "ignored" in current_tags:
+                new_tags.append("ignored")
             self.playlist_tree.item(item, tags=tuple(new_tags))
+        if path is not None and self.playlist_tree.exists(path):
+            self.playlist_tree.tag_configure(
+                "now_playing", foreground=self.palette["highlight_fg"])
+            self._animate_color_fade(
+                "now_playing_tag",
+                lambda color: self.playlist_tree.tag_configure(
+                    "now_playing", background=color),
+                self.palette["field_bg"], self.palette["highlight_bg"],
+                total_steps=8, step_ms=25)
 
     def _sorted_paths(self, paths):
         """Apply the current column sort (set by double-clicking a column
@@ -1302,7 +1423,9 @@ class App:
     def _highlight_library_folders(self, paths):
         """Expand and mark (with a contrasting color) the library tree
         folder(s) containing `paths`, so it's obvious at a glance where
-        the current album/artist filter's tracks live on disk."""
+        the current album/artist filter's tracks live on disk. The
+        highlight's background fades smoothly in rather than appearing
+        instantly."""
         self._clear_library_highlight()
 
         folders = []
@@ -1324,6 +1447,14 @@ class App:
                 ancestor = self.library_tree.parent(ancestor)
 
         if folders:
+            self.library_tree.tag_configure(
+                "filter_match", foreground=self.palette["highlight_fg"])
+            self._animate_color_fade(
+                "filter_match_tag",
+                lambda color: self.library_tree.tag_configure(
+                    "filter_match", background=color),
+                self.palette["field_bg"], self.palette["highlight_bg"],
+                total_steps=8, step_ms=25)
             self.library_tree.see(folders[0])
 
     def remove_selected(self):
@@ -1339,6 +1470,7 @@ class App:
             self.player.playlist.remove(path)
         self.track_tags.pop(path, None)
         self.player.ignored.discard(path)
+        self._apply_library_ignored_mark(path)
         self.player.queue = [p for p in self.player.queue if p != path]
         self._refresh_queue_view()
 
@@ -1391,30 +1523,28 @@ class App:
         item = tree.identify_row(event.y)
         if not item:
             return
-        if (tree is self.library_tree and tree.get_children(item)
-                and os.path.isdir(item)):
-            self._show_viewing_folder_label(tree.item(item, "text") or item)
+        folder_name = self._folder_like_label(tree, item)
+        if folder_name:
+            self._show_viewing_folder_label(folder_name)
         self._play_paths(self._collect_audio_paths(tree, item))
 
-    def _on_playlist_single_click(self, event):
-        """A single left-click on a playlist row plays it (rather than
-        requiring a double-click). Shift/Ctrl-clicks are left alone so
-        extending the selection for multi-track actions (queueing,
-        removing, bulk edit, ...) still works normally, and a click that
-        was actually the end of a drag-onto-a-playlist gesture (released
-        over the library tree) doesn't also start playback."""
-        if event.state & 0x0005:  # Shift (0x0001) or Control (0x0004)
-            return
-        tree = event.widget
-        if tree.identify_region(event.x, event.y) == "heading":
-            return
-        target = self.root.winfo_containing(event.x_root, event.y_root)
-        if target is self.library_tree:
-            return
-        item = tree.identify_row(event.y)
-        if not item:
-            return
-        self._play_paths(self._collect_audio_paths(tree, item))
+    def _folder_like_label(self, tree, item):
+        """The display name to show in the "Currently viewing folder: ..."
+        label for `item`, if it's a folder-like node worth announcing
+        (a real library folder, a playlist, or the "Playlists" root) --
+        i.e. anything with children -- otherwise None (a plain track)."""
+        if tree is not self.library_tree or not tree.get_children(item):
+            return None
+        if item == self._playlists_root_id:
+            return tree.item(item, "text") or "Playlists"
+        playlist_info = next(
+            (info for info in self.playlists.values()
+             if info["node_id"] == item), None)
+        if playlist_info is not None:
+            return playlist_info["name"]
+        if os.path.isdir(item):
+            return tree.item(item, "text") or item
+        return None
 
     def _on_playlist_heading_click(self, event):
         """A single left-click on a playlist column header sorts by that
@@ -1458,6 +1588,15 @@ class App:
             self._show_library_context_menu(event, item)
         else:
             self._show_context_menu(event, tree, item)
+
+    def _on_escape_clear_selection(self, _event=None):
+        """Escape key: clear a multi-track (or single-track) selection in
+        whichever of the playlist table/library tree/queue panel
+        currently has one, so a batch action (queue/remove/bulk edit/...)
+        can be backed out of without clicking away first."""
+        for tree in (self.playlist_tree, self.library_tree, self.queue_tree):
+            if tree.selection():
+                tree.selection_remove(*tree.selection())
 
     def _play_paths(self, paths):
         """Play the first path immediately. If more than one path is given
@@ -1504,9 +1643,7 @@ class App:
         paths = self._collect_audio_paths(self.library_tree, item)
         menu = self._build_context_menu(paths, paths, include_filters=False)
 
-        folder_name = (
-            self.library_tree.item(item, "text") or item
-        ) if os.path.isdir(item) else None
+        folder_name = self._folder_like_label(self.library_tree, item)
         menu.insert_command(
             0, label="View", state=tk.NORMAL if paths else tk.DISABLED,
             command=lambda: self._view_folder(paths, folder_name))
@@ -1800,9 +1937,16 @@ class App:
         menu.add_command(
             label="Remove from Playlist",
             command=lambda: self.context_remove_from_playlist(selected_paths))
-        menu.add_command(label="Ignore",
+        ignore_label = (
+            "Un-ignore" if selected_paths and all(
+                p in self.player.ignored for p in selected_paths)
+            else "Ignore")
+        menu.add_command(label=ignore_label,
                          command=lambda: self.context_ignore(selected_paths))
         menu.add_separator()
+        menu.add_command(
+            label="Normalize Track Numbers",
+            command=lambda: self.context_normalize_track_numbers(selected_paths))
         menu.add_command(label="Properties",
                          command=lambda: self.open_properties(selected_paths))
         return menu
@@ -1896,19 +2040,54 @@ class App:
 
     def _make_drag_indicator(self, count):
         """A small borderless window that follows the cursor while
-        dragging track(s) onto a playlist, showing how many are selected."""
+        dragging track(s) onto a playlist, showing how many are selected.
+        Fades in on appearance (via window alpha) rather than popping up
+        instantly -- see _destroy_drag_indicator for the matching
+        fade-out."""
         try:
             top = tk.Toplevel(self.root)
             top.overrideredirect(True)
             top.attributes("-topmost", True)
+            try:
+                top.attributes("-alpha", 0.0)
+            except tk.TclError:
+                pass
             noun = "track" if count == 1 else "tracks"
             tk.Label(
                 top, text=f"{count} {noun}", padx=6, pady=2, font=("", 9),
                 bg=self.palette["highlight_bg"], fg=self.palette["highlight_fg"],
             ).pack()
+            self._fade_toplevel_alpha(top, 0.0, 0.92)
             return top
         except tk.TclError:
             return None
+
+    def _fade_toplevel_alpha(self, window, start_alpha, end_alpha,
+                             total_steps=6, step_ms=20, on_complete=None):
+        """Animate a Toplevel's `-alpha` window attribute from
+        `start_alpha` to `end_alpha` (0.0-1.0), for smooth fade-in/out of
+        transient popups like the drag indicator. Silently no-ops if the
+        window (or the platform) doesn't support `-alpha`."""
+        def step(i=0):
+            if not window.winfo_exists():
+                if on_complete:
+                    on_complete()
+                return
+            ratio = (i + 1) / total_steps
+            alpha = start_alpha + (end_alpha - start_alpha) * ratio
+            try:
+                window.attributes("-alpha", alpha)
+            except tk.TclError:
+                if on_complete:
+                    on_complete()
+                return
+            if i + 1 >= total_steps:
+                if on_complete:
+                    on_complete()
+            else:
+                self.root.after(step_ms, step, i + 1)
+
+        step(0)
 
     def _move_drag_indicator(self, event):
         if self._drag_indicator is not None:
@@ -1920,22 +2099,44 @@ class App:
 
     def _destroy_drag_indicator(self):
         if self._drag_indicator is not None:
-            try:
-                self._drag_indicator.destroy()
-            except tk.TclError:
-                pass
+            window = self._drag_indicator
             self._drag_indicator = None
+            self._fade_toplevel_alpha(
+                window, 0.92, 0.0,
+                on_complete=lambda: self._safe_destroy(window))
+
+    @staticmethod
+    def _safe_destroy(window):
+        try:
+            window.destroy()
+        except tk.TclError:
+            pass
 
     def _on_progress_left_click(self, event):
         """Left-click on the Now Playing progress bar seeks to that
-        position in the track."""
+        position in the track, gliding the bar there smoothly rather
+        than jumping instantly."""
         if self.player.current_index is None or self.current_duration <= 0:
             return
         width = self.now_playing_progress.winfo_width()
         if width <= 0:
             return
         ratio = min(max(event.x / width, 0.0), 1.0)
-        self._seek_to(ratio * self.current_duration)
+        self._animate_seek_bar(ratio * self.current_duration)
+
+    def _animate_seek_bar(self, target_seconds, total_steps=6, step_ms=20):
+        start_value = self.now_playing_progress["value"] or 0.0
+
+        def step(i=0):
+            ratio = (i + 1) / total_steps
+            self._set_progress(
+                start_value + (target_seconds - start_value) * ratio)
+            if i + 1 >= total_steps:
+                self._seek_to(target_seconds)
+            else:
+                self.root.after(step_ms, step, i + 1)
+
+        step(0)
 
     def _on_progress_right_click(self, event):
         """Right-click on the Now Playing progress bar opens the shared
@@ -2005,8 +2206,76 @@ class App:
         self.status_var.set(f"Removed {len(paths)} track(s) from playlist")
 
     def context_ignore(self, paths):
-        self.player.ignored.update(paths)
-        self.status_var.set(f"Ignored {len(paths)} track(s)")
+        """Toggle the "ignored" state of `paths`: if every one of them is
+        already ignored, un-ignore them all; otherwise ignore them all.
+        Ignored tracks are skipped when automatic Next/Previous picks a
+        random/sequential track number (manually playing one still
+        works), and are shown grayed-out with a "\u2717" marker in both the
+        playlist table and the library tree."""
+        if not paths:
+            return
+        already_all_ignored = all(p in self.player.ignored for p in paths)
+        if already_all_ignored:
+            self.player.ignored.difference_update(paths)
+            action = "Un-ignored"
+        else:
+            self.player.ignored.update(paths)
+            action = "Ignored"
+        self._refresh_ignored_marks(paths)
+        self.status_var.set(f"{action} {len(paths)} track(s)")
+
+    def _refresh_ignored_marks(self, paths):
+        """Update the visible "ignored" marker (grayscale + "\u2717" prefix)
+        on `paths`' rows in both the playlist table and the library
+        tree, without a full rebuild of either."""
+        for path in paths:
+            if self.playlist_tree.exists(path):
+                self.playlist_tree.item(
+                    path, values=self._row_values(path), tags=self._row_tags(path))
+            self._apply_library_ignored_mark(path)
+
+    def _apply_library_ignored_mark(self, path):
+        if not self.library_tree.exists(path):
+            return
+        ignored = path in self.player.ignored
+        base_name = os.path.basename(path)
+        text = f"\u2717 {base_name}" if ignored else base_name
+        self.library_tree.item(
+            path, text=text, tags=("ignored",) if ignored else ())
+
+    def context_normalize_track_numbers(self, paths):
+        """Right-click "Normalize Track Numbers": rewrite each track's
+        "tracknumber" tag on disk from whatever format it's currently in
+        (e.g. "01", "3/12") down to just the plain number (e.g. "1",
+        "3"), stripping leading zeros and any "/<total>" suffix. Tracks
+        with no parseable track number are left untouched."""
+        changed = 0
+        skipped = 0
+        for path in paths:
+            current = read_common_tags(path).get("tracknumber", "")
+            match = re.search(r"\d+", current or "")
+            if not match:
+                skipped += 1
+                continue
+            normalized = str(int(match.group(0)))
+            if normalized == current:
+                continue
+            try:
+                apply_common_tags(path, {"tracknumber": normalized})
+            except Exception as exc:
+                self.status_var.set(
+                    f"Failed to normalize {os.path.basename(path)}: {exc}")
+                continue
+            self._update_track_cache(path)
+            changed += 1
+
+        if changed:
+            noun = "track" if changed == 1 else "tracks"
+            suffix = f" ({skipped} skipped, no track number)" if skipped else ""
+            self.status_var.set(
+                f"Normalized track number on {changed} {noun}{suffix}")
+        else:
+            self.status_var.set("No track numbers needed normalizing")
 
     def _validate_numeric_input(self, action, proposed):
         """`validatecommand` for the Track #/Disc #/Year/BPM entry boxes:
@@ -2051,6 +2320,15 @@ class App:
             entries[key] = var
         edit_frame.columnconfigure(1, weight=1)
 
+        # Packed BEFORE the expanding "Details" panel below (even though
+        # it's visually at the bottom) -- Tkinter's pack manager carves
+        # out space in the order widgets are packed, so a side=BOTTOM
+        # widget packed AFTER an expand=True/fill=BOTH one gets squeezed
+        # down to a 0-size sliver (i.e. the Save/Cancel buttons become
+        # invisible). Packing it first reserves its space up front.
+        button_row = ttk.Frame(dialog, padding=(8, 0, 8, 8))
+        button_row.pack(side=tk.BOTTOM, fill=tk.X)
+
         details_frame = ttk.LabelFrame(dialog, text="Details", padding=8)
         details_frame.pack(side=tk.TOP, fill=tk.BOTH,
                            expand=True, padx=8, pady=(0, 8))
@@ -2069,9 +2347,6 @@ class App:
 
         for field, value in read_full_metadata(path):
             tree.insert("", tk.END, values=(field, value))
-
-        button_row = ttk.Frame(dialog, padding=(8, 0, 8, 8))
-        button_row.pack(side=tk.BOTTOM, fill=tk.X)
 
         def on_save():
             updates = {key: var.get() for key, var in entries.items()}
@@ -2249,12 +2524,19 @@ class App:
         artist, title, _album, _dur = read_track_tags(path)
         self.current_duration = get_track_duration(path)
 
-        art_image = get_track_art_image(path) or make_placeholder_art()
-        self.now_playing_art_image = art_image
-        self.art_label.config(image=self.now_playing_art_image)
+        new_art_pil = get_track_art_pil(path) or make_placeholder_art_pil()
+        self._crossfade_art(new_art_pil)
 
         self.now_title_var.set(title)
         self.now_artist_var.set(artist or "Unknown Artist")
+        self._animate_color_fade(
+            "now_playing_title",
+            lambda color: self.now_title_label.configure(foreground=color),
+            self.palette["bg"], self.palette["fg"], total_steps=10, step_ms=20)
+        self._animate_color_fade(
+            "now_playing_artist",
+            lambda color: self.now_artist_label.configure(foreground=color),
+            self.palette["bg"], self.palette["fg"], total_steps=10, step_ms=20)
         self.now_playing_progress.config(maximum=max(self.current_duration, 1))
         self.duration_var.set(format_duration(self.current_duration) or "0:00")
 
@@ -2264,7 +2546,47 @@ class App:
         self.is_paused = False
         self.status_var.set(f"Playing: {title}")
         self._update_play_pause_button()
+        self._pulse_play_pause_button()
         self._tick_progress()
+
+    def _now_playing_text_widgets(self):
+        return (self.now_title_label, self.now_artist_label)
+
+    def _crossfade_art(self, new_art_pil, total_steps=8, step_ms=25):
+        """Smoothly blend the Now Playing album art from whatever's
+        currently shown to `new_art_pil` (a PIL Image), instead of
+        swapping it instantly."""
+        existing_job = self._art_crossfade_job
+        if existing_job is not None:
+            self.root.after_cancel(existing_job)
+            self._art_crossfade_job = None
+
+        old_art_pil = self._current_art_pil
+        if old_art_pil is None or old_art_pil.size != new_art_pil.size:
+            old_art_pil = new_art_pil
+
+        def step(i=0):
+            ratio = (i + 1) / total_steps
+            frame = Image.blend(old_art_pil, new_art_pil, ratio)
+            photo = ImageTk.PhotoImage(frame)
+            self.now_playing_art_image = photo
+            self.art_label.config(image=photo)
+            if i + 1 >= total_steps:
+                self._current_art_pil = new_art_pil
+                self._art_crossfade_job = None
+            else:
+                self._art_crossfade_job = self.root.after(step_ms, step, i + 1)
+
+        step(0)
+
+    def _pulse_play_pause_button(self):
+        """A brief color pulse on the Play/Pause button whenever playback
+        (re)starts, giving visible feedback beyond just the text change."""
+        self._animate_color_fade(
+            self.play_pause_button,
+            lambda color: self.play_pause_button.configure(bg=color),
+            self.palette["select_bg"], self.palette["button_bg"],
+            total_steps=10, step_ms=30)
 
     def _set_progress(self, elapsed):
         capped = max(0.0, min(elapsed, self.current_duration or elapsed))
@@ -2576,6 +2898,8 @@ class App:
 
         art_image = get_track_art_image(path) or make_placeholder_art()
         self.now_playing_art_image = art_image
+        self._current_art_pil = get_track_art_pil(
+            path) or make_placeholder_art_pil()
         self.art_label.config(image=self.now_playing_art_image)
 
         self.now_title_var.set(title)
@@ -2642,6 +2966,18 @@ class App:
     def _on_close(self):
         self._save_cache()
         self.root.destroy()
+
+    def _relaunch_app(self):
+        """"Refresh App" (File menu): save the current session (same as a
+        normal close) then relaunch the whole process from scratch --
+        i.e. a full app restart, restoring from the cache we just wrote
+        the same way a normal launch would."""
+        self._save_cache()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _pick_previous_path(self):
         """Step back to the previously played track number (sequential or
