@@ -40,6 +40,7 @@ from state_cache import load_cache, save_cache
 from styles import STYLESHEET, THEMES, resolve_style
 from playlist_cue import read_cue_playlist, write_cue_playlist, unique_cue_path, PLAYLISTS_DIR
 from excel_log import append_folder_log
+from visualizer import analyze_track_spectrum
 
 
 class App:
@@ -107,6 +108,30 @@ class App:
         self._disk_hires_image = None  # supersampled, angle-0 disk (for spin)
         self._disk_angle = 0
         self._disk_spin_job = None
+
+        # "Visualizer" popup window (see open_visualizer/_tick_visualizer):
+        # a per-track frequency-bar animation, analyzed ONCE up front in
+        # a background thread (see visualizer.py's module docstring) and
+        # then indexed by the track's current playback position on every
+        # animation tick. `_visualizer_window`/`_visualizer_canvas` are
+        # None whenever the popup isn't open. `_visualizer_track_path`/
+        # `_visualizer_frames`/`_visualizer_fps` describe whichever
+        # track the currently-held analysis result is FOR (compared
+        # against the actually-playing path every tick, so a track
+        # change naturally triggers re-analysis without needing any
+        # hook in _play_track/on_stop/etc.). `_visualizer_analyzing_path`
+        # is set while a background analysis is in flight, to avoid
+        # kicking off a duplicate thread for the same track.
+        self._visualizer_window = None
+        self._visualizer_canvas = None
+        self._visualizer_bar_ids = []
+        self._visualizer_track_path = None
+        self._visualizer_frames = None
+        self._visualizer_fps = 20
+        self._visualizer_analyzing_path = None
+        self._visualizer_queue = queue.Queue()
+        self._visualizer_tick_job = None
+        self._VISUALIZER_NUM_BARS = 32
 
         # Background library-scanning state (see _start_library_scan):
         # a thread-safe queue that scan worker thread(s) push results
@@ -310,6 +335,9 @@ class App:
         playback_menu.add_command(label="Stop", command=self.on_stop)
         playback_menu.add_command(label="Previous", command=self.on_previous)
         playback_menu.add_command(label="Next", command=self.on_next)
+        playback_menu.add_separator()
+        playback_menu.add_command(
+            label="Visualizer...", command=self.open_visualizer)
         menu_bar.add_cascade(label="Playback", menu=playback_menu)
 
         library_menu = tk.Menu(menu_bar, tearoff=0)
@@ -465,6 +493,11 @@ class App:
             controls_row, text="Repeat", width=8, relief=tk.RAISED,
             command=self.toggle_repeat)
         self.repeat_button.pack(side=tk.LEFT, padx=4)
+
+        self.visualizer_button = tk.Button(
+            controls_row, text="Visualizer", width=10, relief=tk.RAISED,
+            command=self.open_visualizer)
+        self.visualizer_button.pack(side=tk.LEFT, padx=4)
 
         progress_row = ttk.Frame(info_frame)
         progress_row.pack(fill=tk.X, pady=(6, 0))
@@ -829,6 +862,16 @@ class App:
             self.right_box_base_color = self._rgb_of(palette["bg"])
             if self.right_box_bg_source_image is not None:
                 self._set_right_box_background(self.right_box_bg_source_image)
+
+        if self._visualizer_window is not None and self._visualizer_window.winfo_exists():
+            self._visualizer_window.configure(bg=palette["field_bg"])
+            self._visualizer_canvas.configure(bg=palette["field_bg"])
+            # Bar item ids are recreated (not just recolored) on the next
+            # tick if their count doesn't match -- forcing a "all"-clear
+            # here is simplest to guarantee the message/bar colors below
+            # never look stale after a theme switch.
+            self._visualizer_canvas.delete("all")
+            self._visualizer_bar_ids = []
 
         if getattr(self, "_current_art_pil", None) is not None:
             # Rebuild the Now Playing "spinning disk" so its corner-fill
@@ -3486,10 +3529,19 @@ class App:
         self.now_playing_progress["value"] = capped
         self.elapsed_var.set(format_duration(capped) or "0:00")
 
+    def _current_elapsed_seconds(self):
+        """Seconds elapsed into the currently-playing/paused/stopped
+        track, kept in sync with the seek bar's own tracking. Used by
+        both `_tick_progress` and the visualizer (see _tick_visualizer)
+        to index into a track's precomputed spectrum frames."""
+        if self.is_playing and not self.is_paused and self.play_started_monotonic is not None:
+            return self.elapsed_before_pause + \
+                (time.monotonic() - self.play_started_monotonic)
+        return self.elapsed_before_pause
+
     def _tick_progress(self):
         if self.is_playing and not self.is_paused:
-            elapsed = self.elapsed_before_pause + \
-                (time.monotonic() - self.play_started_monotonic)
+            elapsed = self._current_elapsed_seconds()
             if self.current_duration and elapsed >= self.current_duration:
                 self._set_progress(self.current_duration)
                 self.on_next()
@@ -3497,6 +3549,189 @@ class App:
             self._set_progress(elapsed)
         if self.is_playing:
             self.progress_job = self.root.after(250, self._tick_progress)
+
+    # -- "Visualizer" popup window (per-track frequency-bar animation) ----
+    def open_visualizer(self):
+        """Playback menu / Now Playing bar button: open the visualizer
+        popup (or just bring it to the front if it's already open)."""
+        if self._visualizer_window is not None and self._visualizer_window.winfo_exists():
+            self._visualizer_window.deiconify()
+            self._visualizer_window.lift()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Visualizer")
+        window.geometry("420x220")
+        window.configure(bg=self.palette["field_bg"])
+        window.protocol("WM_DELETE_WINDOW", self._on_visualizer_window_close)
+        window.bind("<Destroy>", self._on_visualizer_window_destroy, add="+")
+
+        canvas = tk.Canvas(
+            window, bg=self.palette["field_bg"], highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        self._visualizer_window = window
+        self._visualizer_canvas = canvas
+        self._visualizer_bar_ids = []
+
+        self._ensure_visualizer_data_for_current_track()
+        self._tick_visualizer()
+
+    def _on_visualizer_window_close(self):
+        # A plain destroy() is enough -- <Destroy> (bound below, in
+        # open_visualizer) handles clearing all the window/job state in
+        # one place regardless of how the window goes away (this button,
+        # Alt+F4, closing the whole app, ...).
+        if self._visualizer_window is not None:
+            self._visualizer_window.destroy()
+
+    def _on_visualizer_window_destroy(self, event):
+        # Toplevel.bind("<Destroy>") also fires for every CHILD widget
+        # being destroyed as part of tearing the window down (the
+        # canvas, etc.) -- only react to the event for the window
+        # itself, or this would fire (and null out state / cancel jobs
+        # multiple times) for each child too.
+        if event.widget is not self._visualizer_window:
+            return
+        if self._visualizer_tick_job is not None:
+            self.root.after_cancel(self._visualizer_tick_job)
+            self._visualizer_tick_job = None
+        self._visualizer_window = None
+        self._visualizer_canvas = None
+        self._visualizer_bar_ids = []
+
+    def _ensure_visualizer_data_for_current_track(self):
+        """Kick off a background analysis (see visualizer.py) of the
+        currently-playing track's spectrum, if it isn't already the
+        track the held analysis results are for (or already being
+        analyzed)."""
+        path = self._current_playing_path()
+        if not path:
+            return
+        if path == self._visualizer_track_path:
+            return
+        if path == self._visualizer_analyzing_path:
+            return
+        self._visualizer_analyzing_path = path
+        thread = threading.Thread(
+            target=self._visualizer_analysis_worker, args=(path,), daemon=True)
+        thread.start()
+        self.root.after(50, self._drain_visualizer_queue)
+
+    def _visualizer_analysis_worker(self, path):
+        """Runs in a background thread -- MUST NOT touch any Tk widget
+        directly; only ever communicates back via the thread-safe
+        `self._visualizer_queue`."""
+        try:
+            frames, fps = analyze_track_spectrum(
+                path, num_bars=self._VISUALIZER_NUM_BARS)
+        except Exception as exc:
+            self._visualizer_queue.put(("error", path, str(exc)))
+            return
+        self._visualizer_queue.put(("ok", path, frames, fps))
+
+    def _drain_visualizer_queue(self):
+        """Runs on the main/UI thread (scheduled via `root.after`):
+        applies a finished background analysis result, if one's ready."""
+        try:
+            item = self._visualizer_queue.get_nowait()
+        except queue.Empty:
+            # Still analyzing -- keep polling, but only while the popup
+            # is actually open (no point burning timer ticks for a
+            # closed window; _ensure_visualizer_data_for_current_track
+            # will kick off a fresh poll loop next time it's opened).
+            if self._visualizer_window is not None and self._visualizer_window.winfo_exists():
+                self.root.after(50, self._drain_visualizer_queue)
+            return
+
+        kind = item[0]
+        path = item[1]
+        if path == self._visualizer_analyzing_path:
+            self._visualizer_analyzing_path = None
+        if kind == "ok":
+            _, _path, frames, fps = item
+            if path == self._current_playing_path():
+                self._visualizer_track_path = path
+                self._visualizer_frames = frames
+                self._visualizer_fps = fps
+        else:
+            _, _path, message = item
+            logger.debug(
+                "visualizer analysis failed for %s: %s", path, message)
+            if path == self._current_playing_path():
+                self._visualizer_track_path = path
+                self._visualizer_frames = None
+
+    def _tick_visualizer(self):
+        window = self._visualizer_window
+        if window is None or not window.winfo_exists():
+            self._visualizer_tick_job = None
+            return
+
+        path = self._current_playing_path()
+        if path != self._visualizer_track_path:
+            self._ensure_visualizer_data_for_current_track()
+
+        if path and path == self._visualizer_track_path and self._visualizer_frames:
+            frames = self._visualizer_frames
+            elapsed = self._current_elapsed_seconds()
+            frame_index = int(elapsed * self._visualizer_fps)
+            frame_index = max(0, min(frame_index, len(frames) - 1))
+            self._draw_visualizer_frame(frames[frame_index])
+        elif path and path == self._visualizer_track_path and self._visualizer_frames is None:
+            self._draw_visualizer_message(
+                "Visualization unavailable for this track")
+        elif path is None:
+            self._draw_visualizer_message("Nothing playing")
+        else:
+            self._draw_visualizer_message("Analyzing track...")
+
+        self._visualizer_tick_job = self.root.after(50, self._tick_visualizer)
+
+    def _draw_visualizer_message(self, text):
+        canvas = self._visualizer_canvas
+        if canvas is None:
+            return
+        canvas.delete("all")
+        self._visualizer_bar_ids = []
+        width = canvas.winfo_width() or 1
+        height = canvas.winfo_height() or 1
+        canvas.create_text(
+            width // 2, height // 2, text=text, fill=self.palette["field_fg"])
+
+    def _draw_visualizer_frame(self, bars):
+        """Draw one frame's bar heights (a list of `num_bars` floats in
+        0..1) onto the visualizer canvas. Reuses the same rectangle item
+        ids across frames (updating their coordinates/height rather than
+        deleting and recreating them each tick) for smoother, cheaper
+        redraws."""
+        canvas = self._visualizer_canvas
+        if canvas is None:
+            return
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width <= 1 or height <= 1:
+            return
+
+        num_bars = len(bars)
+        gap = 2
+        bar_width = max(1, (width - gap * (num_bars + 1)) / num_bars)
+        bar_color = self.palette["highlight_bg"]
+
+        if len(self._visualizer_bar_ids) != num_bars:
+            canvas.delete("all")
+            self._visualizer_bar_ids = [
+                canvas.create_rectangle(0, 0, 0, 0, fill=bar_color, width=0)
+                for _ in range(num_bars)]
+
+        for i, level in enumerate(bars):
+            bar_height = max(2, level * (height - 4))
+            x0 = gap + i * (bar_width + gap)
+            x1 = x0 + bar_width
+            y1 = height
+            y0 = height - bar_height
+            canvas.coords(self._visualizer_bar_ids[i], x0, y0, x1, y1)
+            canvas.itemconfig(self._visualizer_bar_ids[i], fill=bar_color)
 
     def on_play_pause_toggle(self):
         if self.is_playing and not self.is_paused:
