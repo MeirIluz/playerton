@@ -33,7 +33,7 @@ from audio_tags import (
     make_placeholder_art_pil, get_track_art_pil, read_full_metadata,
     read_common_tags, read_all_track_tags, apply_common_tags,
 )
-from image_utils import fit_image_cover, apply_low_opacity
+from image_utils import fit_image_cover, apply_low_opacity, extract_palette_from_image
 from archive_utils import looks_like_archive, sanitize_filename, parse_album_zip_name
 from player_state import Player
 from state_cache import load_cache, save_cache
@@ -172,6 +172,21 @@ class App:
         self.browsing_mode = bool(self.cache.get("browsing_mode", False))
         self.browsing_mode_var = tk.BooleanVar(value=self.browsing_mode)
 
+        # "Album Art Theme" (View > Album Art Theme): when on, the
+        # entire app's color palette is derived from the currently
+        # playing track's cover art (see image_utils.extract_palette_
+        # from_image / _update_dynamic_theme_from_art) instead of a
+        # fixed theme -- recomputed every time the Now Playing art
+        # settles on a new track. `_dynamic_palette` is the currently
+        # active derived palette (None until a track with art has
+        # played since this was turned on); picking a theme from the
+        # View menu's theme list turns this back off (see set_theme).
+        self.dynamic_theme_enabled = bool(
+            self.cache.get("dynamic_theme_enabled", False))
+        self.dynamic_theme_var = tk.BooleanVar(
+            value=self.dynamic_theme_enabled)
+        self._dynamic_palette = None
+
         # Path to the Excel (.xlsx) "library log" workbook that newly
         # chosen folders get appended to (see _log_scan_to_excel/
         # excel_log.py) -- None until the user has picked one, either
@@ -274,6 +289,10 @@ class App:
             label="Browsing Mode (double-click won't play)",
             variable=self.browsing_mode_var,
             command=self.toggle_browsing_mode)
+        view_menu.add_checkbutton(
+            label="Album Art Theme (dynamic colors)",
+            variable=self.dynamic_theme_var,
+            command=self.toggle_dynamic_theme)
         view_menu.add_separator()
         # Built from styles.THEMES so adding a new theme there (see that
         # module's docstring) automatically gets a menu entry here too --
@@ -655,18 +674,66 @@ class App:
     def set_theme(self, theme_name):
         self.theme_name = theme_name
         self.theme_var.set(theme_name)
+        if self.dynamic_theme_enabled:
+            # Explicitly picking a fixed theme overrides/cancels "Album
+            # Art Theme" -- otherwise the choice would appear to do
+            # nothing (dynamic mode would just keep overriding it on the
+            # next track change).
+            self.dynamic_theme_enabled = False
+            self.dynamic_theme_var.set(False)
+            self._dynamic_palette = None
         self._apply_theme()
         self.status_var.set(f"Theme: {theme_name.replace('_', ' ').title()}")
 
-    def _apply_theme(self):
-        """Apply the selected palette to every widget, driven by the
-        shared CSS-like STYLESHEET (see styles.py): ttk selectors get
-        `ttk.Style().configure(...)` (picked up live by every ttk widget
-        using that style); "#name" selectors reconfigure one specific
-        plain tk widget directly (menus, canvases, and the playlist
-        background photo are handled separately below since they need
-        logic beyond "set these properties")."""
-        palette = THEMES[self.theme_name]
+    def toggle_dynamic_theme(self):
+        """Handler for the View > "Album Art Theme" checkbutton: when
+        on, the app's whole color palette is derived from the currently
+        playing track's cover art instead of a fixed theme (see
+        _update_dynamic_theme_from_art), recomputed on every track
+        change. Turning it off reverts to the previously selected fixed
+        theme."""
+        self.dynamic_theme_enabled = self.dynamic_theme_var.get()
+        if self.dynamic_theme_enabled:
+            if self._current_art_pil is not None:
+                self._update_dynamic_theme_from_art(self._current_art_pil)
+            else:
+                self.status_var.set(
+                    "Album Art Theme: On (will apply once a track with cover art plays)")
+        else:
+            self._dynamic_palette = None
+            self._apply_theme()
+            self.status_var.set("Album Art Theme: Off")
+
+    def _update_dynamic_theme_from_art(self, art_pil):
+        """Recompute and apply the "Album Art Theme" palette from
+        `art_pil` (the Now Playing cover art that just "settled" on a
+        new track) -- a no-op if the feature is currently turned off."""
+        if not self.dynamic_theme_enabled:
+            return
+        try:
+            palette = extract_palette_from_image(art_pil)
+        except Exception:
+            return
+        self._dynamic_palette = palette
+        self._apply_theme(palette)
+        self.status_var.set("Album Art Theme: updated from cover art")
+
+    def _apply_theme(self, palette=None):
+        """Apply `palette` (or, if not given, whichever's currently
+        active -- the "Album Art Theme" dynamic palette if that's turned
+        on, otherwise the selected fixed theme's) to every widget,
+        driven by the shared CSS-like STYLESHEET (see styles.py): ttk
+        selectors get `ttk.Style().configure(...)` (picked up live by
+        every ttk widget using that style); "#name" selectors
+        reconfigure one specific plain tk widget directly (menus,
+        canvases, and the playlist background photo are handled
+        separately below since they need logic beyond "set these
+        properties")."""
+        if palette is None:
+            if self.dynamic_theme_enabled and self._dynamic_palette is not None:
+                palette = self._dynamic_palette
+            else:
+                palette = THEMES[self.theme_name]
         self.palette = palette
 
         # Cancel any in-flight fade animation (now-playing title/artist,
@@ -3399,6 +3466,7 @@ class App:
                 self._art_crossfade_job = None
                 if self.is_playing and not self.is_paused:
                     self._start_disk_spin()
+                self._update_dynamic_theme_from_art(new_art_pil)
             else:
                 self._art_crossfade_job = self.root.after(step_ms, step, i + 1)
 
@@ -3741,6 +3809,7 @@ class App:
         self._disk_angle = 0
         self._set_disk_base(self._current_art_pil)
         self._show_static_art_frame()
+        self._update_dynamic_theme_from_art(self._current_art_pil)
 
         self.now_title_var.set(title)
         self.now_artist_var.set(artist or "Unknown Artist")
@@ -3779,6 +3848,7 @@ class App:
             "theme_name": self.theme_name,
             "disk_spin_enabled": self.disk_spin_enabled,
             "browsing_mode": self.browsing_mode,
+            "dynamic_theme_enabled": self.dynamic_theme_enabled,
             "library_log_path": self.library_log_path,
             "library_roots": self._deduped_library_roots(),
             "playlist": list(self.player.playlist),
