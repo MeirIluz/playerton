@@ -64,6 +64,42 @@ def read_track_tags(path):
     return artist, title, album, duration
 
 
+def read_all_track_tags(path):
+    """Single-file-open equivalent of calling BOTH read_track_tags() and
+    read_common_tags() on the same path: opens/parses the file with
+    mutagen exactly ONCE and extracts everything the playlist table's
+    columns need (artist/title/album/duration, plus every extra
+    COMMON_TAG_FIELDS key: album artist/genre/year/track #/disc #/BPM).
+    Used by the library scanner (see App._library_scan_worker), where
+    parsing every file's tags TWICE was a big chunk of the "takes a
+    while to load a big library" cost. Returns a dict with the same
+    shape as App._read_all_track_tags previously built by hand from the
+    two separate calls."""
+    result = {key: "" for key, _label in COMMON_TAG_FIELDS}
+    result["duration"] = ""
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        audio = None
+    if audio is not None:
+        if audio.tags:
+            if isinstance(audio.tags, ID3):
+                _read_raw_id3_into(audio.tags, result)
+            else:
+                for key in list(result.keys()):
+                    if key == "duration":
+                        continue
+                    values = audio.tags.get(key)
+                    if values:
+                        result[key] = values[0]
+        if getattr(audio, "info", None) is not None:
+            result["duration"] = format_duration(
+                getattr(audio.info, "length", None))
+    if not result.get("title"):
+        result["title"] = os.path.basename(path)
+    return result
+
+
 def get_track_duration(path):
     try:
         audio = MutagenFile(path)

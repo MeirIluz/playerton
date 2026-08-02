@@ -4,12 +4,14 @@ controls, progress bar, and a right-side skip-buttons box with an optional
 low-opacity background photo)."""
 
 import os
+import queue
 import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from collections import Counter
@@ -29,7 +31,7 @@ from logging_setup import logger
 from audio_tags import (
     format_duration, read_track_tags, get_track_duration,
     make_placeholder_art_pil, get_track_art_pil, read_full_metadata,
-    read_common_tags, apply_common_tags,
+    read_common_tags, read_all_track_tags, apply_common_tags,
 )
 from image_utils import fit_image_cover, apply_low_opacity
 from archive_utils import looks_like_archive, sanitize_filename, parse_album_zip_name
@@ -37,6 +39,7 @@ from player_state import Player
 from state_cache import load_cache, save_cache
 from styles import STYLESHEET, THEMES, resolve_style
 from playlist_cue import read_cue_playlist, write_cue_playlist, unique_cue_path, PLAYLISTS_DIR
+from excel_log import append_folder_log
 
 
 class App:
@@ -97,11 +100,27 @@ class App:
         # "Spinning disk" effect for the Now Playing album art (a CD/
         # vinyl-style circular crop of the current cover art that rotates
         # while a track is actively playing, and freezes when paused/
-        # stopped) -- see _set_disk_base/_start_disk_spin.
+        # stopped) -- see _set_disk_base/_start_disk_spin. Toggled via
+        # View > Spin Album Art (self.disk_spin_enabled/disk_spin_var are
+        # set up further below, once the cache has been loaded).
         self._disk_base_image = None  # native-res, angle-0 disk (PIL Image)
         self._disk_hires_image = None  # supersampled, angle-0 disk (for spin)
         self._disk_angle = 0
         self._disk_spin_job = None
+
+        # Background library-scanning state (see _start_library_scan):
+        # a thread-safe queue that scan worker thread(s) push results
+        # onto, drained on the main/UI thread via root.after so that
+        # opening/restoring a folder with a lot of tracks doesn't freeze
+        # the window -- tag reads (the slow part) happen off-thread.
+        # `_library_scans` maps a scan id -> {"path", "total", "done",
+        # "announce"} for that scan's own progress/completion message;
+        # `_library_scan_active` is how many scans are still running.
+        self._library_scan_queue = queue.Queue()
+        self._library_scans = {}
+        self._library_scan_next_id = 1
+        self._library_scan_active = 0
+        self._library_scan_drain_job = None
 
         # Index being dragged in the queue panel, for click-and-drag
         # reordering (session-only UI state).
@@ -136,6 +155,33 @@ class App:
         self.theme_name = saved_theme if saved_theme in THEMES else "dark"
         self.theme_var = tk.StringVar(value=self.theme_name)
         self.palette = THEMES[self.theme_name]
+
+        # Whether the Now Playing album art spins like a CD while a
+        # track plays (View > Spin Album Art); on by default.
+        self.disk_spin_enabled = bool(
+            self.cache.get("disk_spin_enabled", True))
+        self.disk_spin_var = tk.BooleanVar(value=self.disk_spin_enabled)
+
+        # "Browsing mode" (View > Browsing Mode): when on, double-
+        # clicking a track/folder/queue row no longer starts playback --
+        # it only ever starts via an explicit "Play"/"Play Now" from the
+        # right-click menu. Lets you freely browse the library/playlist
+        # and do other actions (queue, tag edits, drag-to-playlist, ...)
+        # while something is already playing, without a stray
+        # double-click accidentally interrupting it. Off by default.
+        self.browsing_mode = bool(self.cache.get("browsing_mode", False))
+        self.browsing_mode_var = tk.BooleanVar(value=self.browsing_mode)
+
+        # Path to the Excel (.xlsx) "library log" workbook that newly
+        # chosen folders get appended to (see _log_scan_to_excel/
+        # excel_log.py) -- None until the user has picked one, either
+        # proactively (File > Set Library Log File...) or when first
+        # prompted the first time a folder is actually added. Once
+        # declined for this session (_library_log_prompt_declined),
+        # further folder-adds skip the prompt/logging silently rather
+        # than asking every single time.
+        self.library_log_path = self.cache.get("library_log_path")
+        self._library_log_prompt_declined = False
 
         # Which playlist table columns (Artist/Title/Album/... /BPM) are
         # currently shown; toggled via the table's right-click header menu.
@@ -192,6 +238,11 @@ class App:
         file_menu.add_command(
             label="Import Cue Playlist...", command=self.import_cue_playlist)
         file_menu.add_separator()
+        file_menu.add_command(
+            label="Set Library Log File...", command=self.choose_library_log_path)
+        file_menu.add_command(
+            label="Log Existing Library to Excel", command=self.log_existing_library)
+        file_menu.add_separator()
         file_menu.add_command(label="Refresh App", command=self._relaunch_app)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
@@ -215,6 +266,14 @@ class App:
         view_menu = tk.Menu(menu_bar, tearoff=0)
         view_menu.add_command(label="Library")
         view_menu.add_command(label="Playlist")
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Spin Album Art", variable=self.disk_spin_var,
+            command=self.toggle_disk_spin)
+        view_menu.add_checkbutton(
+            label="Browsing Mode (double-click won't play)",
+            variable=self.browsing_mode_var,
+            command=self.toggle_browsing_mode)
         view_menu.add_separator()
         # Built from styles.THEMES so adding a new theme there (see that
         # module's docstring) automatically gets a menu entry here too --
@@ -264,13 +323,17 @@ class App:
         ttk.Button(toolbar, text=">>|", width=4, style="Transport.TButton",
                    command=self.on_next).pack(side=tk.LEFT, padx=2)
 
-        self.seek_var = tk.DoubleVar(value=0)
-        seek = ttk.Scale(toolbar, from_=0, to=100,
-                         variable=self.seek_var, orient=tk.HORIZONTAL)
-        seek.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        # Background library-scan loading bar (see _start_library_scan/
+        # _show_loading_bar): sits where a seek bar might otherwise go,
+        # but is only ever packed/visible while a scan is actually
+        # running -- built here (not packed immediately) so
+        # _show_loading_bar can insert it in this exact spot (via
+        # `before=self.volume_label`) whenever a scan starts.
+        self._build_loading_bar(toolbar)
 
-        ttk.Label(toolbar, text="Vol", style="ToolbarLabel.TLabel").pack(
-            side=tk.LEFT, padx=(10, 2))
+        self.volume_label = ttk.Label(
+            toolbar, text="Vol", style="ToolbarLabel.TLabel")
+        self.volume_label.pack(side=tk.LEFT, padx=(10, 2))
         self.volume_var = tk.DoubleVar(value=80)
         volume = ttk.Scale(toolbar, from_=0, to=100, variable=self.volume_var,
                            orient=tk.HORIZONTAL, length=100, command=self.on_volume_change)
@@ -314,6 +377,22 @@ class App:
         ]).lower()
         return self.search_query in haystack
 
+    # -- background library-scan loading bar (hidden unless a scan is
+    # actively running -- see _start_library_scan/_show_loading_bar) -----
+    def _build_loading_bar(self, parent):
+        self.loading_frame = ttk.Frame(parent, padding=(0, 0, 4, 0))
+        # Deliberately NOT packed here -- _show_loading_bar/_hide_loading_bar
+        # pack/unpack it on demand, so it only takes up space while a
+        # library scan is actually in progress.
+        self.loading_bar_var = tk.StringVar(value="")
+        ttk.Label(
+            self.loading_frame, textvariable=self.loading_bar_var,
+            style="ToolbarLabel.TLabel", width=26, anchor=tk.W,
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        self.loading_progress = ttk.Progressbar(
+            self.loading_frame, orient=tk.HORIZONTAL, mode="determinate")
+        self.loading_progress.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
     # -- now playing bar --------------------------------------------------
     def _build_now_playing_bar(self):
         frame = ttk.Frame(self.root, relief=tk.RIDGE, borderwidth=1, padding=8)
@@ -321,9 +400,10 @@ class App:
 
         self._current_art_pil = make_placeholder_art_pil()
         self._set_disk_base(self._current_art_pil)
-        self.now_playing_art_image = ImageTk.PhotoImage(self._disk_base_image)
+        self.now_playing_art_image = ImageTk.PhotoImage(self._current_art_pil)
         self.art_label = tk.Label(frame, image=self.now_playing_art_image)
         self.art_label.pack(side=tk.LEFT, padx=(0, 10))
+        self._show_static_art_frame()
 
         self._build_right_box(frame)
 
@@ -686,16 +766,13 @@ class App:
         if getattr(self, "_current_art_pil", None) is not None:
             # Rebuild the Now Playing "spinning disk" so its corner-fill
             # color (and rim/hole colors) match the new theme, instead of
-            # keeping the old theme's background baked into the image.
+            # keeping the old theme's background baked into the image
+            # (kept up to date even while the effect is toggled off, so
+            # it's ready to display correctly as soon as it's turned
+            # back on).
             self._set_disk_base(self._current_art_pil)
             if self._disk_spin_job is None:
-                photo = ImageTk.PhotoImage(
-                    self._disk_frame_from_hires(
-                        self._disk_hires_image, self._disk_base_image.size[0],
-                        self._disk_angle)
-                    if self._disk_angle else self._disk_base_image)
-                self.now_playing_art_image = photo
-                self.art_label.config(image=photo)
+                self._show_static_art_frame()
 
         if getattr(self, "playlist_bg_source_image", None) is not None:
             # Force Tk to finish recomputing geometry from the style
@@ -923,6 +1000,10 @@ class App:
         row = self.queue_tree.identify_row(event.y)
         if not row:
             return
+        if self.browsing_mode:
+            self.status_var.set(
+                "Browsing Mode is on -- right-click > Play Now to play this track")
+            return
         self._play_queue_index(int(row))
 
     def _on_queue_right_click(self, event):
@@ -1135,38 +1216,283 @@ class App:
         if not path:
             return
         self.player.library_roots.append(path)
-        root_id = self.library_tree.insert(
+        self.library_tree.insert(
             "", tk.END, iid=path, text=os.path.basename(path) or path, open=True)
+        self._start_library_scan(path)
 
-        added = self._populate_library_node(root_id, path)
-        self.status_var.set(f"Added {added} file(s) from {path}")
+    # -- background library scanning (folders + tag reads off the UI
+    # thread, so opening/restoring a large library doesn't freeze the
+    # window) -----------------------------------------------------------
+    def _start_library_scan(self, dirpath, announce=True, log=True):
+        """Kick off a background thread that walks `dirpath` and reads
+        every track's tags, feeding results back to the main thread via
+        `self._library_scan_queue` (drained by `_drain_library_scan_queue`,
+        polled with `root.after`). `dirpath` itself must already exist as
+        a node in the library tree (its iid IS its path, per the
+        existing convention) -- only its descendants are added here.
+        `log=True` records this folder's tracks (Album/Artist/Year) to
+        the Excel library log once the scan finishes (see
+        _log_scan_to_excel) -- pass `log=False` for scans that AREN'T a
+        genuinely new folder the user just chose (e.g. re-scanning
+        already-known roots on launch), so the log doesn't get a
+        duplicate entry for the same folder every single session."""
+        scan_id = self._library_scan_next_id
+        self._library_scan_next_id += 1
+        self._library_scans[scan_id] = {
+            "path": dirpath, "total": 0, "done": 0, "announce": announce,
+            "log": log, "log_entries": [],
+        }
+        self._library_scan_active += 1
+        self._show_loading_bar()
 
-    def _populate_library_node(self, parent_id, dirpath):
-        """Recursively mirror `dirpath` into the library tree as a
-        collapsible/expandable node, listing subfolders and music files.
-        Also appends any music files found to the playlist. Returns the
-        number of music files added.
-        """
-        added = 0
+        thread = threading.Thread(
+            target=self._library_scan_worker, args=(scan_id, dirpath),
+            daemon=True)
+        thread.start()
+
+        if self._library_scan_drain_job is None:
+            self._library_scan_drain_job = self.root.after(
+                15, self._drain_library_scan_queue)
+
+    def _library_scan_worker(self, scan_id, dirpath):
+        """Runs in a background thread -- MUST NOT touch any Tk widget or
+        `self.player`/`self.track_tags` directly (not thread-safe); only
+        ever communicates back via the thread-safe `self._library_scan_queue`."""
+        put = self._library_scan_queue.put
+
+        total = 0
+        for _root, _dirs, files in os.walk(dirpath):
+            total += sum(1 for f in files if f.lower().endswith(MUSIC_EXTENSIONS))
+        put(("total", scan_id, total))
+
+        def walk(parent_dir):
+            try:
+                entries = sorted(
+                    os.scandir(parent_dir), key=lambda e: (not e.is_dir(), e.name.lower()))
+            except OSError:
+                return
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if is_dir:
+                    put(("dir", scan_id, parent_dir, entry.path, entry.name))
+                    walk(entry.path)
+                elif entry.name.lower().endswith(MUSIC_EXTENSIONS):
+                    tags = read_all_track_tags(entry.path)
+                    put(("file", scan_id, parent_dir, entry.path, tags))
+
+        walk(dirpath)
+        put(("scan_done", scan_id))
+
+    def _drain_library_scan_queue(self):
+        """Runs on the main/UI thread (scheduled via `root.after`): applies
+        a batch of results pushed by any active `_library_scan_worker`
+        thread(s) to the library tree/playlist/loading bar, then
+        reschedules itself until every scan has finished AND the queue is
+        empty.
+
+        The per-tick batch size is capped fairly low (rather than
+        draining everything available in one shot) ON PURPOSE: the
+        background scan thread(s) can easily outrun the few hundred
+        milliseconds it takes just to build the rest of the UI at
+        startup, so by the time the window draws its first real frame
+        the whole scan may already be sitting fully-queued/finished --
+        without a cap, that first drain call would swallow the entire
+        queue AND hide the loading bar in that same tick, so the bar
+        would never actually become visible to the user even though the
+        scan genuinely did happen in the background. Capping the batch
+        forces several `root.after` ticks (i.e. several rendered frames)
+        no matter how fast the scan itself was, so the loading bar/
+        progress is actually seen."""
+        processed = 0
         try:
-            entries = sorted(
-                os.scandir(dirpath), key=lambda e: (not e.is_dir(), e.name.lower()))
-        except OSError:
-            return added
+            while processed < 40:
+                item = self._library_scan_queue.get_nowait()
+                processed += 1
+                kind = item[0]
+                if kind == "file":
+                    _, scan_id, parent_id, entry_path, tags = item
+                    if not self.library_tree.exists(entry_path):
+                        self.library_tree.insert(
+                            parent_id, tk.END, iid=entry_path,
+                            text=os.path.basename(entry_path), open=False)
+                    self._register_scanned_track(entry_path, tags)
+                    self._apply_library_ignored_mark(entry_path)
+                    scan = self._library_scans.get(scan_id)
+                    if scan is not None:
+                        scan["done"] += 1
+                        if scan["log"]:
+                            scan["log_entries"].append((
+                                tags.get("album", ""), tags.get("artist", ""),
+                                tags.get("date", "")))
+                elif kind == "dir":
+                    _, _scan_id, parent_id, entry_path, entry_name = item
+                    if not self.library_tree.exists(entry_path):
+                        self.library_tree.insert(
+                            parent_id, tk.END, iid=entry_path,
+                            text=entry_name, open=False)
+                elif kind == "total":
+                    _, scan_id, total = item
+                    scan = self._library_scans.get(scan_id)
+                    if scan is not None:
+                        scan["total"] = total
+                elif kind == "scan_done":
+                    _, scan_id = item
+                    self._library_scan_active -= 1
+                    scan = self._library_scans.pop(scan_id, None)
+                    if scan is not None:
+                        if scan["announce"]:
+                            noun = "file" if scan["done"] == 1 else "files"
+                            self.status_var.set(
+                                f"Added {scan['done']} {noun} from {scan['path']}")
+                        if scan["log"] and scan["log_entries"]:
+                            self._log_scan_to_excel(
+                                scan["path"], scan["log_entries"])
+        except queue.Empty:
+            pass
 
-        for entry in entries:
-            if entry.is_dir():
-                child_id = self.library_tree.insert(
-                    parent_id, tk.END, iid=entry.path, text=entry.name, open=False)
-                added += self._populate_library_node(child_id, entry.path)
-            elif entry.name.lower().endswith(MUSIC_EXTENSIONS):
-                self.library_tree.insert(
-                    parent_id, tk.END, iid=entry.path, text=entry.name, open=False)
-                self._add_track(entry.path)
-                self._apply_library_ignored_mark(entry.path)
-                added += 1
+        self._update_loading_bar()
 
-        return added
+        if self._library_scan_active > 0 or not self._library_scan_queue.empty():
+            self._library_scan_drain_job = self.root.after(
+                15, self._drain_library_scan_queue)
+        else:
+            self._library_scan_drain_job = None
+            self._hide_loading_bar()
+
+    def _update_loading_bar(self):
+        if not hasattr(self, "loading_progress"):
+            return
+        total = sum(s["total"] for s in self._library_scans.values())
+        done = sum(s["done"] for s in self._library_scans.values())
+        total = max(total, done, 1)
+        self.loading_progress.configure(maximum=total)
+        self.loading_progress["value"] = done
+        self.loading_bar_var.set(f"Loading library... {done}/{total}")
+
+    def _show_loading_bar(self):
+        if not hasattr(self, "loading_frame"):
+            return
+        if not self.loading_frame.winfo_ismapped():
+            self.loading_frame.pack(
+                side=tk.LEFT, fill=tk.X, expand=True, padx=10,
+                before=self.volume_label)
+        self._update_loading_bar()
+
+    def _hide_loading_bar(self):
+        if not hasattr(self, "loading_frame"):
+            return
+        self.loading_frame.pack_forget()
+
+    # -- Excel "library log" (records newly chosen folders' tracks) ------
+    def choose_library_log_path(self):
+        """File menu action: (re)choose where the "chosen folders" Excel
+        log is saved. Lets the user set one up proactively, or move/
+        replace an existing one, rather than only ever being asked the
+        first time a folder happens to get added."""
+        path = filedialog.asksaveasfilename(
+            title="Choose Library Log File", defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("All files", "*.*")],
+            initialfile=os.path.basename(self.library_log_path)
+            if self.library_log_path else "library_log.xlsx")
+        if not path:
+            return
+        self.library_log_path = path
+        self._library_log_prompt_declined = False
+        self.status_var.set(f"Library log will be saved to: {path}")
+
+    def _ensure_library_log_path(self):
+        """Return the path to log "chosen folder" entries to, prompting
+        the user to choose one THE FIRST TIME it's needed and reusing it
+        afterward (see excel_log.py's module docstring for the file
+        format). Returns None if no path is set and the user
+        cancels/declines the prompt -- logging is then skipped silently
+        for that scan (a repeated prompt on every single folder-add
+        would get old fast; use File > Set Library Log File... to set
+        one up later if they change their mind this session)."""
+        if self.library_log_path:
+            return self.library_log_path
+        if self._library_log_prompt_declined:
+            return None
+        path = filedialog.asksaveasfilename(
+            title="Choose where to save the library log (Excel file)",
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx"), ("All files", "*.*")],
+            initialfile="library_log.xlsx")
+        if not path:
+            self._library_log_prompt_declined = True
+            return None
+        self.library_log_path = path
+        return path
+
+    def _log_scan_to_excel(self, folder_path, entries):
+        """Append `entries` (a list of (album, artist, year) tuples, one
+        per track found) for `folder_path` to the Excel library log,
+        prompting for its location the first time it's needed (see
+        _ensure_library_log_path). No-ops silently if the user hasn't
+        set one up / declines when asked."""
+        log_path = self._ensure_library_log_path()
+        if not log_path:
+            return
+        try:
+            append_folder_log(log_path, folder_path, entries)
+        except Exception as exc:
+            self.status_var.set(f"Could not write library log: {exc}")
+
+    def log_existing_library(self):
+        """File menu action: log every ALREADY-ADDED library folder's
+        tracks to the Excel library log in one go -- for folders that
+        were added before this feature existed (or before a log path
+        was chosen), which otherwise never get an entry since only
+        NEWLY added folders are logged automatically."""
+        deduped_roots = self._deduped_library_roots()
+        if not deduped_roots:
+            self.status_var.set("No library folders to log")
+            return
+
+        log_path = self._ensure_library_log_path()
+        if not log_path:
+            self.status_var.set("Cancelled: no library log file chosen")
+            return
+
+        # Group every currently-loaded track under whichever of its
+        # (deduped, outermost) library roots it actually lives under, so
+        # a track isn't logged twice if one root is nested inside
+        # another and both ended up in library_roots.
+        roots_by_length = sorted(deduped_roots, key=len, reverse=True)
+        entries_by_root = {root: [] for root in deduped_roots}
+        for path in self.player.playlist:
+            for root_dir in roots_by_length:
+                root_with_sep = root_dir.rstrip(os.sep) + os.sep
+                if path == root_dir or path.startswith(root_with_sep):
+                    tags = self.track_tags.get(path, {})
+                    entries_by_root[root_dir].append(
+                        (tags.get("album", ""), tags.get("artist", ""),
+                         tags.get("date", "")))
+                    break
+
+        logged_folders = 0
+        logged_tracks = 0
+        for root_dir, entries in entries_by_root.items():
+            if not entries:
+                continue
+            try:
+                append_folder_log(log_path, root_dir, entries)
+            except Exception as exc:
+                self.status_var.set(f"Could not write library log: {exc}")
+                return
+            logged_folders += 1
+            logged_tracks += len(entries)
+
+        if logged_folders:
+            self.status_var.set(
+                f"Logged {logged_tracks} track(s) from {logged_folders} "
+                f"existing folder(s) to the library log")
+        else:
+            self.status_var.set(
+                "No tracks found in existing library folders to log")
 
     def import_album_archive(self, zip_path):
         """Unzip an album archive and file its tracks under
@@ -1220,7 +1546,7 @@ class App:
                 shutil.move(src, dest)
                 moved += 1
 
-            self._add_library_folder(artist_dir)
+            self._add_library_folder(artist_dir, announce=False)
             self.status_var.set(
                 f"Imported {moved} track(s) into {os.path.relpath(album_dir, dest_root)}")
         finally:
@@ -1256,9 +1582,13 @@ class App:
             candidate = f"{root} ({counter}){ext}"
         return candidate
 
-    def _add_library_folder(self, dirpath):
+    def _add_library_folder(self, dirpath, announce=True, log=True):
         """Add or refresh `dirpath` as a top-level node in the library tree
-        and merge any newly found tracks into the playlist."""
+        and merge any newly found tracks into the playlist (scanned in
+        the background -- see _start_library_scan). `log=False` skips
+        recording this folder to the Excel library log (used when
+        re-adding an already-known folder on launch -- see
+        _restore_from_cache)."""
         is_new = dirpath not in self.player.library_roots
         if self.library_tree.exists(dirpath):
             # Already present in the tree (either as a previously-added
@@ -1273,13 +1603,25 @@ class App:
         if is_new:
             self.player.library_roots.append(dirpath)
 
-        self._populate_library_node(dirpath, dirpath)
+        self._start_library_scan(dirpath, announce=announce, log=log)
 
     def _add_track(self, path):
         if path in self.player.playlist:
             return
+        self._register_scanned_track(path, self._read_all_track_tags(path))
+
+    def _register_scanned_track(self, path, tags):
+        """Like _add_track, but takes already-computed `tags` instead of
+        reading them from disk itself -- used by the background library
+        scanner (see _library_scan_worker/_drain_library_scan_queue),
+        which reads each file's tags off the main thread so scanning a
+        large library doesn't block the UI. No-ops if `path` is already
+        in the playlist (mirrors _add_track's existing behavior of never
+        overwriting an already-loaded track's tags)."""
+        if path in self.player.playlist:
+            return
         self.player.playlist.append(path)
-        self.track_tags[path] = self._read_all_track_tags(path)
+        self.track_tags[path] = tags
         if self._track_passes_filter(path):
             if self.playlist_sort_key:
                 # A column sort is active: re-sort so the new track lands
@@ -1293,21 +1635,9 @@ class App:
     def _read_all_track_tags(self, path):
         """Read every metadata field the playlist table can show for
         `path` (artist/title/album/duration plus the optional columns:
-        album artist, genre, year, track #, disc #, BPM)."""
-        artist, title, album, duration = read_track_tags(path)
-        extra = read_common_tags(path)
-        return {
-            "artist": artist,
-            "title": title,
-            "album": album,
-            "duration": duration,
-            "albumartist": extra.get("albumartist", ""),
-            "genre": extra.get("genre", ""),
-            "date": extra.get("date", ""),
-            "tracknumber": extra.get("tracknumber", ""),
-            "discnumber": extra.get("discnumber", ""),
-            "bpm": extra.get("bpm", ""),
-        }
+        album artist, genre, year, track #, disc #, BPM), in a single
+        file open/parse (see audio_tags.read_all_track_tags)."""
+        return read_all_track_tags(path)
 
     def _row_values(self, path):
         tags = self.track_tags.get(path, {})
@@ -1592,6 +1922,19 @@ class App:
         if not item:
             return
         folder_name = self._folder_like_label(tree, item)
+        if self.browsing_mode:
+            # Browsing Mode: double-click never starts playback -- just
+            # view a folder's tracklist (or, for a single track, do
+            # nothing beyond the normal single-click selection). Use
+            # the right-click menu's "Play"/"Play Now" to actually start
+            # something while browsing.
+            paths = self._collect_audio_paths(tree, item)
+            if folder_name:
+                self._view_folder(paths, folder_name)
+            else:
+                self.status_var.set(
+                    "Browsing Mode is on -- right-click > Play to play this track")
+            return
         if folder_name:
             self._show_viewing_folder_label(folder_name)
         self._play_paths(self._collect_audio_paths(tree, item))
@@ -2924,12 +3267,71 @@ class App:
         self._disk_hires_image = hires
         self._disk_base_image = self._disk_frame_from_hires(hires, diameter)
 
+    def _show_static_art_frame(self):
+        """Display a single, non-animating frame for the Now Playing
+        album art, honoring the `disk_spin_enabled` toggle (View > Spin
+        Album Art): the circular CD-style disk (at its current, possibly
+        nonzero, rotation) when enabled, or just the plain square album
+        cover -- no circular crop/rim at all -- when disabled. Used
+        whenever the display needs to be (re)set outside of the
+        continuous spin loop itself (toggling the effect, pausing/
+        stopping, a theme change, ...)."""
+        if self._current_art_pil is None:
+            return
+        if self.disk_spin_enabled and self._disk_base_image is not None:
+            if self._disk_angle and self._disk_hires_image is not None:
+                diameter = self._disk_base_image.size[0]
+                frame = self._disk_frame_from_hires(
+                    self._disk_hires_image, diameter, self._disk_angle)
+            else:
+                frame = self._disk_base_image
+        else:
+            frame = self._current_art_pil
+        photo = ImageTk.PhotoImage(frame)
+        self.now_playing_art_image = photo
+        self.art_label.config(image=photo)
+
     def _start_disk_spin(self):
         """Begin (or resume) continuously rotating the Now Playing disk.
-        A no-op if it's already spinning."""
+        A no-op if it's already spinning, or if the effect is turned off
+        (View > Spin Album Art)."""
+        if not self.disk_spin_enabled:
+            return
         if self._disk_spin_job is not None or self._disk_hires_image is None:
             return
         self._spin_disk_step()
+
+    def toggle_disk_spin(self):
+        """Handler for the View > "Spin Album Art" checkbutton: turns the
+        continuous CD-spin animation on/off. Turning it OFF immediately
+        reverts the display to just the plain square album cover (no
+        circular disk/rim at all); turning it back ON resumes the disk
+        rendering from the same rotation angle it was frozen at."""
+        self.disk_spin_enabled = self.disk_spin_var.get()
+        if self.disk_spin_enabled:
+            if self.is_playing and not self.is_paused:
+                self._start_disk_spin()
+            else:
+                self._show_static_art_frame()
+            self.status_var.set("Album art spin: On")
+        else:
+            self._stop_disk_spin()
+            self._show_static_art_frame()
+            self.status_var.set("Album art spin: Off")
+
+    def toggle_browsing_mode(self):
+        """Handler for the View > "Browsing Mode" checkbutton: when on,
+        double-clicking a track/folder/queue row no longer starts
+        playback -- only an explicit "Play"/"Play Now" from the
+        right-click menu does. Lets you browse the library/playlist and
+        do other actions freely while something's already playing,
+        without a stray double-click accidentally switching tracks."""
+        self.browsing_mode = self.browsing_mode_var.get()
+        if self.browsing_mode:
+            self.status_var.set(
+                "Browsing Mode: On (right-click > Play to start a track)")
+        else:
+            self.status_var.set("Browsing Mode: Off")
 
     def _spin_disk_step(self):
         if not (self.is_playing and not self.is_paused) or self._disk_hires_image is None:
@@ -2957,21 +3359,22 @@ class App:
 
     def _reset_disk_spin(self):
         """Stop spinning and snap back to angle 0 -- used on Stop, so the
-        next Play starts from a clean, un-rotated disk."""
+        next Play starts from a clean, un-rotated disk (or, if the
+        effect is currently turned off, just the plain album cover)."""
         self._stop_disk_spin()
         self._disk_angle = 0
-        if self._disk_base_image is not None:
-            photo = ImageTk.PhotoImage(self._disk_base_image)
-            self.now_playing_art_image = photo
-            self.art_label.config(image=photo)
+        self._show_static_art_frame()
 
     def _crossfade_art(self, new_art_pil, total_steps=8, step_ms=25):
         """Smoothly blend the Now Playing album art from whatever's
         currently shown to `new_art_pil` (a PIL Image), instead of
-        swapping it instantly. Each blended frame is rendered as a
+        swapping it instantly. When the spinning-disk effect is enabled
+        (View > Spin Album Art), each blended frame is rendered as a
         circular "disk" (frozen at the current rotation) -- once the
         blend finishes, the new track's disk becomes the spin base and
-        rotation resumes (if a track is actively playing)."""
+        rotation resumes (if a track is actively playing). When the
+        effect is disabled, the blend uses the plain square art instead,
+        with no circular disk/rim at all."""
         existing_job = self._art_crossfade_job
         if existing_job is not None:
             self.root.after_cancel(existing_job)
@@ -2985,8 +3388,9 @@ class App:
         def step(i=0):
             ratio = (i + 1) / total_steps
             frame = Image.blend(old_art_pil, new_art_pil, ratio)
-            disk_frame = self._make_disk_image(frame, angle=self._disk_angle)
-            photo = ImageTk.PhotoImage(disk_frame)
+            if self.disk_spin_enabled:
+                frame = self._make_disk_image(frame, angle=self._disk_angle)
+            photo = ImageTk.PhotoImage(frame)
             self.now_playing_art_image = photo
             self.art_label.config(image=photo)
             if i + 1 >= total_steps:
@@ -3258,14 +3662,24 @@ class App:
     # -- session cache (remembers library/playlist/backgrounds/settings) -
     def _restore_from_cache(self):
         """Re-populate the library/playlist, background images, and Now
-        Playing bar from the previous session's saved state, if any."""
+        Playing bar from the previous session's saved state, if any.
+        Library folders are (re)scanned in the BACKGROUND (see
+        _start_library_scan) so a large library doesn't freeze the
+        window on launch -- the previously-playing track (if any) is
+        loaded synchronously first (just one file), so the Now Playing
+        bar still restores immediately without waiting on those scans."""
         cache = self.cache
         if not cache:
             return
 
+        now_playing = cache.get("now_playing") or {}
+        now_playing_path = now_playing.get("path")
+        if now_playing_path and os.path.isfile(now_playing_path):
+            self._add_track(now_playing_path)
+
         for root_dir in sorted(cache.get("library_roots", []), key=len):
             if os.path.isdir(root_dir):
-                self._add_library_folder(root_dir)
+                self._add_library_folder(root_dir, announce=False, log=False)
 
         # Any individually-opened files (not under a library folder) are
         # saved separately; _add_track is a no-op for paths already added
@@ -3298,13 +3712,15 @@ class App:
             except Exception:
                 pass
 
-        now_playing = cache.get("now_playing") or {}
-        path = now_playing.get("path")
-        if path and path in self.player.playlist:
+        if now_playing_path and now_playing_path in self.player.playlist:
             self._restore_now_playing_display(
-                path, now_playing.get("elapsed", 0.0))
+                now_playing_path, now_playing.get("elapsed", 0.0))
 
-        self.status_var.set("Restored previous session")
+        if self._library_scan_active:
+            self.status_var.set(
+                "Restored previous session -- loading library in background...")
+        else:
+            self.status_var.set("Restored previous session")
 
     def _restore_now_playing_display(self, path, elapsed):
         """Restore the Now Playing bar to show the last-played track (art,
@@ -3324,8 +3740,7 @@ class App:
             path) or make_placeholder_art_pil()
         self._disk_angle = 0
         self._set_disk_base(self._current_art_pil)
-        self.now_playing_art_image = ImageTk.PhotoImage(self._disk_base_image)
-        self.art_label.config(image=self.now_playing_art_image)
+        self._show_static_art_frame()
 
         self.now_title_var.set(title)
         self.now_artist_var.set(artist or "Unknown Artist")
@@ -3362,6 +3777,9 @@ class App:
 
         data = {
             "theme_name": self.theme_name,
+            "disk_spin_enabled": self.disk_spin_enabled,
+            "browsing_mode": self.browsing_mode,
+            "library_log_path": self.library_log_path,
             "library_roots": self._deduped_library_roots(),
             "playlist": list(self.player.playlist),
             "right_box_bg_path": self.right_box_bg_path,
