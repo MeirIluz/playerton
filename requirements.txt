@@ -1,0 +1,14 @@
+# Playerton dependencies. Install with:
+#     pip install -r requirements.txt
+# Minimum versions are the ones Playerton was developed and tested with
+# (Python 3.12, Windows 11). Tkinter ships with the python.org installer.
+
+# Running the app
+pygame>=2.6.1        # audio playback (when the equalizer is off)
+pillow>=12.3.0       # album art, spinning disc, background photos, icons
+mutagen>=1.47.0      # reading/writing tags, embedded lyrics
+miniaudio>=1.73      # audio decoding/output for the equalizer engine
+numpy>=2.5.5         # equalizer DSP (FFT filtering)
+
+# Packaging into dist/Playerton/ (python build_app.py)
+pyinstaller>=6.22.3
