@@ -380,13 +380,6 @@ STYLESHEET = {
         "highlightbackground": "bg",
         "cursor": "hand2",
     },
-    "#visualizer_button": {
-        "font": FONTS["button"],
-        "bg": "button_bg", "fg": "button_fg",
-        "activebackground": "select_bg", "activeforeground": "select_fg",
-        "highlightbackground": "bg",
-        "relief": "raised", "cursor": "hand2",
-    },
     "#art_label": {
         "bg": "field_bg",
     },
