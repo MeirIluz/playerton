@@ -68,10 +68,12 @@ _FILE_TYPE_BY_EXT = {
 
 
 def _file_type_for(path):
+    """Cue FILE type keyword for an audio file (by extension; default WAVE)."""
     return _FILE_TYPE_BY_EXT.get(os.path.splitext(path)[1].lower(), "WAVE")
 
 
 def _escape(value):
+    """Make a value safe inside a quoted cue sheet field."""
     # Cue sheets have no real escaping mechanism for embedded quotes;
     # substituting a plain apostrophe is the common workaround.
     return (value or "").replace('"', "'")

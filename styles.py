@@ -43,9 +43,11 @@ regardless of the active theme.
 Not covered here (handled separately, in `App._apply_theme`, since they
 need logic beyond "set these properties"):
   - tk.Menu widgets (colored via `App._menu_colors()`).
-  - The right-side Now Playing box's canvas + background photo blending
-    (`App._build_right_box`/`_set_right_box_background`), and the
-    playlist table's background photo (`App._apply_playlist_background`).
+  - The right-side Now Playing box's canvas, and the playlist table's
+    background photo (`App._apply_playlist_background`).
+  - Settings > "Match Player Colors to Background Image", which swaps
+    the theme palette for one generated from that photo
+    (`image_utils.palette_from_image`).
   - Row highlighting tags ("now_playing"/"in_queue" on the playlist
     table, "filter_match" on the library tree) -- these represent
     transient PLAYBACK/SELECTION STATE, not a fixed widget look, and are
@@ -182,9 +184,44 @@ PALETTE_KEYS = (
     "highlight_bg", "highlight_fg", "queue_bg", "queue_fg",
 )
 
+# Human-readable name + description of each palette key, shown in the
+# View > "Edit Custom Theme..." window (mirrors the PALETTE_KEYS comment
+# block above -- keep the two in sync).
+PALETTE_DESCRIPTIONS = {
+    "bg": ("Background", "Window, frame and label background"),
+    "fg": ("Text", "General text: labels, menus, headings"),
+    "field_bg": ("Content background", "Playlist/library/queue tables and text boxes"),
+    "field_fg": ("Content text", "Text inside tables and text boxes"),
+    "select_bg": ("Selection", "Selected row, hovered/pressed buttons and menus"),
+    "select_fg": ("Selection text", "Text on a selected row or hovered button"),
+    "button_bg": ("Button", "Buttons and table column headers"),
+    "button_fg": ("Button text", "Text on buttons and column headers"),
+    "trough_bg": ("Slider track", "Behind the seek/volume sliders, progress bar and scrollbars"),
+    "highlight_bg": ("Now playing", "Currently playing track's row, matched library folder"),
+    "highlight_fg": ("Now playing text", "Text on the now-playing highlight"),
+    "queue_bg": ("Queued", "Rows of tracks waiting in the queue, library search matches"),
+    "queue_fg": ("Queued text", "Text on queued rows"),
+}
+
+# Name of the user-editable theme (View > Custom / Edit Custom Theme...).
+# Its colors are stored in the session cache rather than in this file;
+# App adds it to THEMES at startup.
+CUSTOM_THEME_NAME = "custom"
+
 # Fonts are deliberately left at the platform default family (""), only
 # varying size/weight, so the app doesn't depend on any specific font
 # being installed.
+#
+# A theme dict MAY also define these optional (non-color) keys. The ones
+# set in View > "Edit Custom Theme..." are stored on the Custom theme but
+# applied on top of EVERY theme (App._active_palette):
+#   font_family       Family used for EVERY font role below instead of
+#                     the platform default ("" / missing = default).
+#   font_size_offset  Points added to every role's size (e.g. 2 makes
+#                     all text 2pt bigger; headings stay relatively
+#                     bigger since each role keeps its own base size).
+FONT_KEYS = ("font_family", "font_size_offset")
+
 FONTS = {
     "base": ("", 9),
     "small": ("", 8),
@@ -193,6 +230,8 @@ FONTS = {
     "subtitle": ("", 9),
     "button": ("", 9),
     "nav_button": ("", 8),
+    "lyrics": ("", 11),               # lyrics panel text
+    "lyrics_current": ("", 12, "bold"),  # the line being sung (synced lyrics)
     "time": ("", 9),
 }
 
@@ -386,6 +425,17 @@ STYLESHEET = {
 }
 
 
+def resolve_font(font, palette):
+    """Apply the palette's optional font_family / font_size_offset (see
+    FONT_KEYS) to a FONTS-style (family, size, *styles) tuple."""
+    family = palette.get("font_family") or font[0]
+    try:
+        offset = int(palette.get("font_size_offset", 0) or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    return (family, max(6, font[1] + offset)) + tuple(font[2:])
+
+
 def resolve_style(props, palette):
     """Resolve a STYLESHEET rule's color placeholders (palette key names)
     against `palette`, returning a plain kwargs dict ready to pass to
@@ -396,6 +446,8 @@ def resolve_style(props, palette):
     for prop, value in props.items():
         if prop in _COLOR_PROPS and isinstance(value, str):
             resolved[prop] = palette.get(value, value)
+        elif prop == "font" and isinstance(value, tuple):
+            resolved[prop] = resolve_font(value, palette)
         else:
             resolved[prop] = value
     return resolved

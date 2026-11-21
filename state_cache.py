@@ -7,6 +7,10 @@ convenience cache, not critical state."""
 import json
 import os
 
+# NOTE: the folder keeps its original "tiny_player" name from before the
+# app was renamed to Playerton -- saved playlists store absolute paths into
+# it (playlists/*.cue, including each playlist's parent link), so moving it
+# would break every existing playlist.
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".config", "tiny_player")
 CACHE_FILE = os.path.join(CACHE_DIR, "state.json")
 

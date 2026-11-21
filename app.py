@@ -1,7 +1,39 @@
-"""The Tiny Player GUI: menu bar, transport toolbar, library tree,
-playlist view, status bar, and the Now Playing bar (art, transport
-controls, progress bar, and a right-side skip-buttons box with an optional
-low-opacity background photo)."""
+"""The Playerton GUI and player logic (the App class), plus the theme
+editor window (ThemeEditor).
+
+How to find your way around App -- each feature is a block starting with
+a "# -- name --" comment, in this order:
+
+  menu bar              themed in-window menu bar + dropdown menus
+  transport toolbar     |<< Play Pause Stop >>|, seek (drag to scrub) +
+                        volume sliders
+  search bar / mode     main search; Live vs. On Enter search mode
+  now playing bar       spinning-disc art, title/artist, controls, progress
+  right-side box        the small |<< >>| box at the right of Now Playing
+  color-fade helper     the smooth color fades used all over the UI
+  equalizer             Settings > Equalizer: presets, custom presets
+                        (the audio side lives in audio_engine.py)
+  theming               themes, title bar colors, fonts, custom theme,
+                        "match colors to background image"
+  library + playlist    left folder tree, right playlist table
+  library tools         library search, Collapse All / Expand All
+  lyrics panel          right-side lyrics, synced highlighting, LRCLIB
+  queue panel           the "play next" queue under the library
+  playlist columns      choosing which columns the table shows
+  playlist background   photo behind the playlist table
+  status bar            fading one-line messages at the bottom
+  file/folder actions   opening files/folders, importing .zip albums
+  context menus         right-click / double-click in the trees
+  cue playlists         playlists stored as .cue files
+  drag-and-drop         dragging tracks onto a playlist
+  playback              play/pause/next/previous, shuffle/repeat, the
+                        spinning disc animation and progress timer
+  session cache         saving/restoring everything between launches
+
+Everything runs on Tk's single UI thread except workers that never touch
+Tk objects: the disc-frame pre-render thread (App._start_disk_prerender),
+online lyrics lookups (App._load_lyrics) and, while the EQ is on,
+miniaudio's audio thread (audio_engine.EqPlayer)."""
 
 import os
 import random
@@ -9,16 +41,22 @@ import re
 import shutil
 import subprocess
 import sys
+import queue
 import tempfile
+import threading
 import time
 import zipfile
 from collections import Counter
 
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog
+from tkinter import ttk, filedialog, simpledialog, colorchooser
+import tkinter.font as tkfont
 
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import pygame
+
+from audio_engine import AudioOutput, EQ_BANDS, EQ_PRESETS, clamp_gains
+from lyrics import find_local_lyrics, fetch_online_lyrics
 
 from constants import (
     MUSIC_EXTENSIONS, MUSIC_FILETYPES, IMAGE_FILETYPES,
@@ -31,16 +69,59 @@ from audio_tags import (
     make_placeholder_art_pil, get_track_art_pil, read_full_metadata,
     read_common_tags, apply_common_tags,
 )
-from image_utils import fit_image_cover, apply_low_opacity
+from image_utils import fit_image_cover, apply_low_opacity, palette_from_image
 from archive_utils import looks_like_archive, sanitize_filename, parse_album_zip_name
 from player_state import Player
 from state_cache import load_cache, save_cache
-from styles import STYLESHEET, THEMES, resolve_style
+from styles import (
+    STYLESHEET, THEMES, resolve_style, PALETTE_KEYS, PALETTE_DESCRIPTIONS,
+    CUSTOM_THEME_NAME, FONTS, FONT_KEYS, resolve_font)
+from state_cache import CACHE_DIR
 from playlist_cue import read_cue_playlist, write_cue_playlist, unique_cue_path, PLAYLISTS_DIR
 
 
+def render_disk_frame(hires_image, diameter, angle, fill_color,
+                      disc_enabled, supersample):
+    """Pure (thread-safe, no Tk) render of one Now Playing disc frame:
+    rotate the supersampled disc by `angle` degrees, then shrink it to
+    `diameter` pixels. Used both on the main thread and by the background
+    pre-render thread (see App._start_disk_prerender).
+
+    A slight Gaussian blur is applied BEFORE the downsample: LANCZOS (needed
+    for a crisp result) rings/overshoots on very high-contrast edges -- like
+    the bright white rim against a dark theme's background -- which shows
+    up as a faint dark "outline" just outside the rim. Pre-blurring
+    band-limits that edge just enough to remove the ringing (the radius is
+    tiny relative to the supersampled size, so the art stays sharp)."""
+    if not disc_enabled:
+        # Plain square cover: no rim edge to de-ring, keep it crisp.
+        return hires_image.resize((diameter, diameter), Image.LANCZOS)
+    if angle:
+        hires_image = hires_image.rotate(
+            -angle, resample=Image.BICUBIC, fillcolor=fill_color)
+    blurred = hires_image.filter(ImageFilter.GaussianBlur(radius=supersample / 2))
+    return blurred.resize((diameter, diameter), Image.LANCZOS)
+
+
 class App:
+    """The whole Playerton window and everything it does.
+
+    Layout, top to bottom: themed menu bar, transport toolbar (prev / play /
+    pause / stop / next, seek and volume sliders), the main search bar, then
+    a horizontal split -- library folder tree + queue panel on the left, the
+    playlist table on the right -- and finally the Now Playing bar (spinning
+    disc art, title/artist, controls, progress) and the status bar.
+
+    State lives in a few places: `self.player` (Player: playlist paths,
+    library roots, queue, ignored set, current index), `self.track_tags`
+    (cached tag values per path), `self.playlists` (cue-sheet playlists),
+    and the session cache (state_cache.py) that restores all of it on the
+    next launch. Each "# -- section --" comment below groups one feature."""
     def __init__(self, root):
+        """Set up all state, restore settings from the session cache, build
+        every part of the UI (in pack order: menu, toolbar, search, status
+        bar, Now Playing bar, body), apply the theme, then restore the previous
+        session's library/playlist/now-playing track."""
         self.root = root
         self.player = Player()
         self.track_tags = {}  # path -> {"artist", "title", "album", "duration"}
@@ -58,6 +139,10 @@ class App:
             self.audio_ready = True
         except Exception:
             self.audio_ready = False
+        # All playback goes through AudioOutput (audio_engine.py): pygame
+        # while the EQ is off, the numpy/miniaudio EQ engine while it's on.
+        self.audio = AudioOutput(self.audio_ready)
+        self.audio_ready = True  # AudioOutput reports/handles its own failures
 
         self.is_playing = False
         self.is_paused = False
@@ -132,10 +217,105 @@ class App:
         self.cache = load_cache()
 
         # Dark mode is on by default; "dark_blue" is a selectable variant.
+        # User-editable "Custom" theme (View > Edit Custom Theme...):
+        # starts as a copy of Dark, overlaid with any saved colors.
+        custom = dict(THEMES["dark"])
+        saved_custom = self.cache.get("custom_theme")
+        if isinstance(saved_custom, dict):
+            custom.update({
+                key: value for key, value in saved_custom.items()
+                if key in PALETTE_KEYS and self._is_hex_color(value)})
+        if isinstance(saved_custom, dict):
+            family = saved_custom.get("font_family")
+            if isinstance(family, str):
+                custom["font_family"] = family
+            offset = saved_custom.get("font_size_offset")
+            if isinstance(offset, int):
+                custom["font_size_offset"] = max(-4, min(12, offset))
+        THEMES[CUSTOM_THEME_NAME] = custom
+        self.theme_editor = None
+
+        # Equalizer (Settings > Equalizer...): on/off, the 10 band gains,
+        # which preset they came from (None = edited by hand), and the
+        # user's own named presets. Applied to the audio output right away;
+        # the EQ window is self.eq_window while open.
+        self.eq_enabled = bool(self.cache.get("eq_enabled", False))
+        self.eq_gains = clamp_gains(self.cache.get("eq_gains"))
+        saved_presets = self.cache.get("eq_custom_presets")
+        self.eq_custom_presets = {
+            str(name): clamp_gains(gains)
+            for name, gains in (saved_presets.items()
+                                if isinstance(saved_presets, dict) else ())
+            if isinstance(gains, list)}
+        preset = self.cache.get("eq_preset", "Flat")  # new users start on Flat
+        self.eq_preset = preset if (
+            preset in EQ_PRESETS or preset in self.eq_custom_presets) else None
+        self.eq_window = None
+        self.audio.set_eq(self.eq_enabled, self.eq_gains)
+
+        # Lyrics panel (View > Show Lyrics Panel) and online lookup
+        # (Settings > Fetch Lyrics Online). `_lyrics` is the current track's
+        # lyrics.Lyrics (or None); `_lyrics_token` invalidates a background
+        # lookup when the track changes before it returns; results come
+        # back from the worker thread through `_lyrics_queue`.
+        self.show_lyrics_var = tk.BooleanVar(
+            value=bool(self.cache.get("show_lyrics", True)))
+        self.online_lyrics_var = tk.BooleanVar(
+            value=bool(self.cache.get("online_lyrics", True)))
+        self._lyrics = None
+        self._lyrics_path = None
+        self._lyrics_token = 0
+        self._lyrics_queue = queue.Queue()
+        self._lyrics_current_line = None
+
+        # Fonts imported via the theme editor live in FONTS_DIR and are
+        # loaded (privately, for this app only) on every launch.
+        self._register_imported_fonts()
+        # Tk's built-in named fonts (used by entries, menus, dialogs and
+        # any widget without an explicit font), remembered so a theme's
+        # font settings can be applied to / removed from them.
+        self._named_font_defaults = {}
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                     "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                     "TkTooltipFont"):
+            try:
+                named = tkfont.nametofont(name)
+                self._named_font_defaults[name] = (
+                    named.cget("family"), named.cget("size"))
+            except tk.TclError:
+                pass
+
         saved_theme = self.cache.get("theme_name")
         self.theme_name = saved_theme if saved_theme in THEMES else "dark"
         self.theme_var = tk.StringVar(value=self.theme_name)
         self.palette = THEMES[self.theme_name]
+
+        # Settings > "Match Player Colors to Background Image": when on
+        # (and a playlist background image is set), the whole player is
+        # recolored from a palette generated from that image instead of
+        # the selected View theme.
+        self.match_bg_colors_var = tk.BooleanVar(
+            value=bool(self.cache.get("match_bg_colors", False)))
+        self._image_palette = None
+
+        # Settings > "Spinning Disc": when off, the Now Playing art is shown
+        # as the plain square cover instead of a rotating CD-style disc.
+        self.spinning_disc_var = tk.BooleanVar(
+            value=bool(self.cache.get("spinning_disc", True)))
+        # Settings > "Delete Zip After Import": remove the .zip file once
+        # its tracks were successfully extracted by Import Album Archive.
+        self.delete_zip_after_import_var = tk.BooleanVar(
+            value=bool(self.cache.get("delete_zip_after_import", False)))
+        # Search mode shared by the top search bar and the library search:
+        # "live" searches as you type, "enter" only when Enter is pressed
+        # (so typing doesn't keep expanding library folders mid-word).
+        saved_mode = self.cache.get("search_mode")
+        self.search_mode = saved_mode if saved_mode in ("live", "enter") else "enter"
+        self._search_debounce_jobs = {}
+        # Library search results (item ids) and which one Enter jumps to.
+        self._library_search_matches = []
+        self._library_search_index = -1
+        self._library_search_last_query = None
 
         # Which playlist table columns (Artist/Title/Album/... /BPM) are
         # currently shown; toggled via the table's right-click header menu.
@@ -153,12 +333,9 @@ class App:
         self.playlist_sort_key = None
         self.playlist_sort_reverse = False
 
-        self.root.title("Tiny Player")
-        try:
-            self.root.attributes("-zoomed", True)
-        except tk.TclError:
-            self.root.geometry(
-                f"{self.root.winfo_screenwidth()}x{self.root.winfo_screenheight()}+0+0")
+        self.root.title("Playerton")
+        self._set_window_icon()
+        self._maximize_window()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_menu()
@@ -169,14 +346,175 @@ class App:
         self._build_body()
         self._apply_theme()
         self._restore_from_cache()
+        self.root.after(200, self._bring_to_front)
 
         # Escape clears whichever tree currently has a multi-selection
         # (playlist table, library tree, or queue panel) -- a quick way
         # to back out of a multi-track selection without clicking away.
         self.root.bind_all("<Escape>", self._on_escape_clear_selection)
 
+    def _set_window_icon(self):
+        """Window/taskbar icon from assets/ (bundled inside the packaged
+        app, where files live under sys._MEIPASS). assets/icon.gif, if
+        present, is played as an ANIMATED title-bar/taskbar icon; otherwise
+        the static assets/icon.ico is used."""
+        base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+        icon_path = os.path.join(base, "assets", "icon.ico")
+        if os.path.isfile(icon_path):
+            try:
+                self.root.iconbitmap(default=icon_path)
+            except tk.TclError:
+                pass
+        gif_path = os.path.join(base, "assets", "icon.gif")
+        if os.path.isfile(gif_path):
+            self._start_animated_icon(gif_path)
+
+    _ICON_SIZES = (64, 32, 16)  # Tk picks the best fit per spot (taskbar, title bar)
+    _ICON_MAX_FRAMES = 240
+
+    def _start_animated_icon(self, gif_path):
+        """Load every frame of `gif_path` (padded to square, at a few icon
+        sizes) and cycle them through `iconphoto` using the GIF's own frame
+        durations. Windows .ico files can't animate, but a running window
+        can swap its icon, which animates the title bar + taskbar icon."""
+        try:
+            from PIL import ImageSequence
+            gif = Image.open(gif_path)
+            frames = []
+            for index, frame in enumerate(ImageSequence.Iterator(gif)):
+                if index >= self._ICON_MAX_FRAMES:
+                    break
+                rgba = frame.convert("RGBA")
+                side = max(rgba.size)
+                square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+                square.paste(rgba, ((side - rgba.width) // 2,
+                                    (side - rgba.height) // 2))
+                duration = frame.info.get("duration") or gif.info.get("duration") or 100
+                frames.append((square, max(20, int(duration))))
+        except Exception as exc:
+            logger.warning("Could not load animated icon %s: %s", gif_path, exc)
+            return
+        if not frames:
+            return
+        # On Windows each frame is turned into native icon handles ONCE, so
+        # showing a frame is a single cheap WM_SETICON message. (Tk's
+        # iconphoto rebuilds an icon from the image data on every call,
+        # which is what made the animation cost noticeable CPU.)
+        self._native_icon_frames = (
+            self._build_native_icon_frames(frames) if sys.platform == "win32" else None)
+        if self._native_icon_frames:
+            self._icon_frames = [
+                (handles, duration) for handles, (_img, duration)
+                in zip(self._native_icon_frames, frames)]
+        else:
+            self._icon_frames = [
+                ([ImageTk.PhotoImage(img.resize((size, size), Image.LANCZOS))
+                  for size in self._ICON_SIZES], duration)
+                for img, duration in frames]  # keep PhotoImages alive
+        self._icon_frame_index = 0
+        self._show_icon_frame()
+
+    def _build_native_icon_frames(self, frames):
+        """Windows: build (small, big) HICON pairs for every frame, at the
+        system's own small/large icon sizes. Returns None on failure (the
+        caller then falls back to Tk's iconphoto)."""
+        try:
+            import ctypes
+            import io
+            user32 = ctypes.windll.user32
+            user32.CreateIconFromResourceEx.restype = ctypes.c_void_p
+            user32.CreateIconFromResourceEx.argtypes = [
+                ctypes.c_char_p, ctypes.c_uint, ctypes.c_int, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            small = user32.GetSystemMetrics(49) or 16  # SM_CXSMICON
+            big = user32.GetSystemMetrics(11) or 32    # SM_CXICON
+
+            def hicon(img, size):
+                """Turn one PIL image into a Windows icon handle (HICON) of `size`
+                pixels, via an in-memory PNG icon resource."""
+                buf = io.BytesIO()
+                img.resize((size, size), Image.LANCZOS).save(buf, format="PNG")
+                data = buf.getvalue()
+                # PNG-compressed icon resource (Vista+); 0x00030000 = version.
+                handle = user32.CreateIconFromResourceEx(
+                    data, len(data), True, 0x00030000, size, size, 0)
+                if not handle:
+                    raise OSError("CreateIconFromResourceEx failed")
+                return handle
+
+            return [(hicon(img, small), hicon(img, big)) for img, _d in frames]
+        except Exception as exc:
+            logger.debug("Native animated icon unavailable: %s", exc)
+            return None
+
+    def _show_icon_frame(self):
+        """Show the next frame of the animated window icon, then schedule the
+        frame after it using that frame's own GIF duration. Uses native
+        WM_SETICON on Windows (cheap), else Tk's iconphoto."""
+        icons, duration = self._icon_frames[self._icon_frame_index]
+        if self._native_icon_frames:
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            except tk.TclError:
+                return  # window is gone
+            send = ctypes.windll.user32.SendMessageW
+            send.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                             ctypes.c_size_t, ctypes.c_void_p]
+            WM_SETICON = 0x0080
+            send(hwnd, WM_SETICON, 0, icons[0])  # ICON_SMALL: title bar
+            send(hwnd, WM_SETICON, 1, icons[1])  # ICON_BIG: taskbar, Alt+Tab
+        else:
+            try:
+                self.root.iconphoto(True, *icons)
+            except tk.TclError:
+                return  # window is gone
+        if len(self._icon_frames) > 1:
+            self._icon_frame_index = (self._icon_frame_index + 1) % len(self._icon_frames)
+            self.root.after(duration, self._show_icon_frame)
+
+    def _bring_to_front(self):
+        """Raise and focus the window once it's shown. Windows' focus-
+        stealing protection otherwise often leaves a freshly launched app
+        behind whatever was active (e.g. the editor/terminal that started
+        it), only flashing on the taskbar. Briefly making it "topmost" is
+        allowed and puts it in front; it's turned off again right after so
+        it behaves like a normal window."""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(
+                300, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _maximize_window(self):
+        """Open maximized within the usable desktop area. A window sized
+        to the full screen resolution ends up underneath the Windows
+        taskbar (hiding the Now Playing controls); a real maximize leaves
+        room for it on every platform."""
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        # Sensible size/position to fall back to when un-maximized.
+        width, height = int(screen_w * 0.8), int(screen_h * 0.8)
+        self.root.geometry(
+            f"{width}x{height}+{(screen_w - width) // 2}+{(screen_h - height) // 3}")
+        try:
+            self.root.state("zoomed")  # Windows / macOS
+        except tk.TclError:
+            try:
+                self.root.attributes("-zoomed", True)  # X11 / Linux
+            except tk.TclError:
+                pass
+
     # -- menu bar ---------------------------------------------------
     def _build_menu(self):
+        """Build the File / Edit / View / Playback / Library / Settings / Help
+        menus. They're built as tk.Menu cascades on `menu_bar` (the single
+        source of truth for menu contents) and then shown by the themed,
+        in-window menu bar (_build_themed_menu_bar) instead of the native one."""
         menu_bar = tk.Menu(self.root)
         self.menu_bar = menu_bar
         self._top_menus = []
@@ -213,8 +551,9 @@ class App:
         menu_bar.add_cascade(label="Edit", menu=edit_menu)
 
         view_menu = tk.Menu(menu_bar, tearoff=0)
-        view_menu.add_command(label="Library")
-        view_menu.add_command(label="Playlist")
+        view_menu.add_checkbutton(
+            label="Show Lyrics Panel", variable=self.show_lyrics_var,
+            command=self._on_toggle_lyrics_panel)
         view_menu.add_separator()
         # Built from styles.THEMES so adding a new theme there (see that
         # module's docstring) automatically gets a menu entry here too --
@@ -224,6 +563,9 @@ class App:
                 label=theme_name.replace("_", " ").title(), value=theme_name,
                 variable=self.theme_var,
                 command=lambda t=theme_name: self.set_theme(t))
+        view_menu.add_separator()
+        view_menu.add_command(
+            label="Edit Custom Theme...", command=self.open_theme_editor)
         menu_bar.add_cascade(label="View", menu=view_menu)
 
         playback_menu = tk.Menu(menu_bar, tearoff=0)
@@ -239,17 +581,139 @@ class App:
             label="Add Folder to Library...", command=self.open_folder)
         menu_bar.add_cascade(label="Library", menu=library_menu)
 
+        settings_menu = tk.Menu(menu_bar, tearoff=0)
+        settings_menu.add_checkbutton(
+            label="Match Player Colors to Background Image",
+            variable=self.match_bg_colors_var,
+            command=self._on_toggle_match_bg_colors)
+        settings_menu.add_checkbutton(
+            label="Spinning Disc (Now Playing Art)",
+            variable=self.spinning_disc_var,
+            command=self._on_toggle_spinning_disc)
+        settings_menu.add_checkbutton(
+            label="Delete Zip After Import",
+            variable=self.delete_zip_after_import_var,
+            command=self._on_toggle_delete_zip)
+        settings_menu.add_checkbutton(
+            label="Fetch Lyrics Online (LRCLIB)",
+            variable=self.online_lyrics_var,
+            command=self._on_toggle_online_lyrics)
+        settings_menu.add_separator()
+        settings_menu.add_command(
+            label="Equalizer...", command=self.open_equalizer)
+        menu_bar.add_cascade(label="Settings", menu=settings_menu)
+
         help_menu = tk.Menu(menu_bar, tearoff=0)
         help_menu.add_command(label="About")
         menu_bar.add_cascade(label="Help", menu=help_menu)
 
         self._top_menus = [
-            file_menu, edit_menu, view_menu, playback_menu, library_menu, help_menu,
+            file_menu, edit_menu, view_menu, playback_menu, library_menu,
+            settings_menu, help_menu,
         ]
-        self.root.config(menu=menu_bar)
+        self._build_themed_menu_bar(menu_bar)
+
+    def _build_themed_menu_bar(self, menu_bar):
+        """Show the menus as a row of labels inside the window instead of
+        attaching `menu_bar` as the native menu bar: on Windows the native
+        menu bar is always drawn white by the OS (Tk can't recolor it),
+        which clashed with every theme. Clicking a label pops up the same
+        dropdown menu (those *can* be themed). The tk.Menu cascades in
+        `menu_bar` stay the single source of truth for menu contents."""
+        bar = tk.Frame(self.root, bd=0, highlightthickness=0)
+        bar.pack(side=tk.TOP, fill=tk.X)
+        self.themed_menu_bar = bar
+        self._menu_bar_labels = []
+        self._menu_bar_items = []  # (label, dropdown menu) pairs
+        self._open_menu_label = None
+        self._menu_switch_target = None
+        self._menu_slide_job = None
+        for index in range(menu_bar.index(tk.END) + 1):
+            if menu_bar.type(index) != "cascade":
+                continue
+            text = menu_bar.entrycget(index, "label")
+            submenu = self.root.nametowidget(menu_bar.entrycget(index, "menu"))
+            label = tk.Label(bar, text=text, padx=8, pady=3, cursor="hand2")
+            label.pack(side=tk.LEFT)
+            label.bind("<Button-1>",
+                       lambda _e, l=label, m=submenu: self._post_menu_bar_menu(l, m))
+            label.bind("<Enter>", lambda _e, l=label: self._set_menu_label_hover(l, True))
+            label.bind("<Leave>", lambda _e, l=label: self._set_menu_label_hover(l, False))
+            self._menu_bar_labels.append(label)
+            self._menu_bar_items.append((label, submenu))
+
+    def _post_menu_bar_menu(self, label, menu):
+        """Open `menu` under its menu-bar `label`. While it's open, moving
+        the mouse onto another menu-bar label closes it and opens that
+        one instead ("sliding" between menus, like a native menu bar)."""
+        target = (label, menu)
+        while target is not None:
+            label, menu = target
+            self._menu_switch_target = None
+            self._open_menu_label = label
+            for other in self._menu_bar_labels:
+                self._set_menu_label_hover(other, False)
+            if sys.platform == "win32":
+                self._menu_slide_job = self.root.after(
+                    40, self._poll_menu_bar_slide)
+            try:
+                menu.tk_popup(label.winfo_rootx(),
+                              label.winfo_rooty() + label.winfo_height())
+            finally:
+                menu.grab_release()
+                if self._menu_slide_job is not None:
+                    self.root.after_cancel(self._menu_slide_job)
+                    self._menu_slide_job = None
+                self._open_menu_label = None
+                self._set_menu_label_hover(label, False)
+            target = self._menu_switch_target
+
+    def _poll_menu_bar_slide(self):
+        """Runs (via timers, which Tk keeps servicing while a native
+        Windows dropdown is open) to detect the pointer moving onto a
+        different menu-bar label; closes the open dropdown with the Win32
+        EndMenu call so _post_menu_bar_menu can open the new one."""
+        self._menu_slide_job = None
+        if self._open_menu_label is None:
+            return
+        try:
+            x, y = self.root.winfo_pointerxy()
+            widget = self.root.winfo_containing(x, y)
+        except (tk.TclError, KeyError):
+            widget = None
+        for label, menu in self._menu_bar_items:
+            if widget is label and label is not self._open_menu_label:
+                self._menu_switch_target = (label, menu)
+                try:
+                    import ctypes
+                    ctypes.windll.user32.EndMenu()
+                except Exception:
+                    self._menu_switch_target = None
+                return
+        self._menu_slide_job = self.root.after(40, self._poll_menu_bar_slide)
+
+    def _set_menu_label_hover(self, label, hovered):
+        """Color a menu-bar label as highlighted (hovered or its dropdown is
+        open) or normal, using the current theme."""
+        palette = self.palette
+        if hovered or label is self._open_menu_label:
+            label.configure(bg=palette["select_bg"], fg=palette["select_fg"])
+        else:
+            label.configure(bg=palette["bg"], fg=palette["fg"])
+
+    def _apply_menu_bar_theme(self):
+        """Recolor the themed menu bar and all its labels after a theme change."""
+        if not hasattr(self, "themed_menu_bar"):
+            return
+        self.themed_menu_bar.configure(bg=self.palette["bg"])
+        for label in self._menu_bar_labels:
+            self._set_menu_label_hover(label, False)
 
     # -- transport toolbar --------------------------------------------
     def _build_toolbar(self):
+        """Top transport toolbar: |<< Play Pause Stop >>| buttons, the seek
+        slider (follows playback; click or drag it to move around in the
+        track -- see _on_seek_press), and the volume slider."""
         toolbar = ttk.Frame(self.root, padding=4)
         toolbar.pack(side=tk.TOP, fill=tk.X)
 
@@ -264,10 +728,21 @@ class App:
         ttk.Button(toolbar, text=">>|", width=4, style="Transport.TButton",
                    command=self.on_next).pack(side=tk.LEFT, padx=2)
 
+        # Seek slider. Its value is the position as a fraction of the track
+        # (0-SEEK_RESOLUTION), so it never needs reconfiguring per track.
+        # _set_progress keeps it in sync with playback, except while the
+        # user is dragging it (self._seek_dragging).
         self.seek_var = tk.DoubleVar(value=0)
-        seek = ttk.Scale(toolbar, from_=0, to=100,
+        self._seek_dragging = False
+        seek = ttk.Scale(toolbar, from_=0, to=self.SEEK_RESOLUTION,
                          variable=self.seek_var, orient=tk.HORIZONTAL)
         seek.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+        # Replace ttk.Scale's default mouse handling (which only nudges the
+        # handle a step toward the click) with click-to-jump + drag-to-scrub.
+        seek.bind("<ButtonPress-1>", self._on_seek_press)
+        seek.bind("<B1-Motion>", self._on_seek_motion)
+        seek.bind("<ButtonRelease-1>", self._on_seek_release)
+        self.seek_scale = seek
 
         ttk.Label(toolbar, text="Vol", style="ToolbarLabel.TLabel").pack(
             side=tk.LEFT, padx=(10, 2))
@@ -276,8 +751,54 @@ class App:
                            orient=tk.HORIZONTAL, length=100, command=self.on_volume_change)
         volume.pack(side=tk.LEFT, padx=2)
 
+    # Seek slider value range (fraction of the track, in 1/1000ths).
+    SEEK_RESOLUTION = 1000
+    # Approximate width of the slider handle in the "clam" ttk theme; used
+    # so a click lands the handle's CENTER under the pointer.
+    _SEEK_HANDLE_PX = 30
+
+    def _seek_seconds_at(self, x):
+        """Track position (seconds) for pointer x (pixels) on the seek
+        slider; also moves the slider's handle there."""
+        width = self.seek_scale.winfo_width()
+        usable = max(1, width - self._SEEK_HANDLE_PX)
+        ratio = min(max((x - self._SEEK_HANDLE_PX / 2) / usable, 0.0), 1.0)
+        self.seek_var.set(ratio * self.SEEK_RESOLUTION)
+        return ratio * self.current_duration
+
+    def _on_seek_press(self, event):
+        """Mouse down on the seek slider: start scrubbing from the pointer
+        position (ignored when no track is loaded)."""
+        if self.player.current_index is None or self.current_duration <= 0:
+            return "break"
+        self._seek_dragging = True
+        self._on_seek_motion(event)
+        return "break"  # suppress ttk.Scale's default step behaviour
+
+    def _on_seek_motion(self, event):
+        """While dragging: move the handle and preview the target time in
+        the elapsed-time label (the audio only jumps on release)."""
+        if not self._seek_dragging:
+            return "break"
+        seconds = self._seek_seconds_at(event.x)
+        self.elapsed_var.set(format_duration(seconds) or "0:00")
+        return "break"
+
+    def _on_seek_release(self, event):
+        """Mouse released: seek the audio to where the handle was dropped."""
+        if not self._seek_dragging:
+            return "break"
+        seconds = self._seek_seconds_at(event.x)
+        self._seek_dragging = False
+        self._seek_to(seconds)
+        return "break"
+
     # -- search bar (filters the library tree + playlist table) ----------
     def _build_search_bar(self):
+        """The main search bar under the toolbar. It filters the playlist table
+        by artist/title/album/filename and highlights the library folders
+        containing matches; whether it runs while typing or only on Enter
+        follows the shared search mode (see _on_search_typed)."""
         search_frame = ttk.Frame(self.root, padding=(4, 2))
         search_frame.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(search_frame, text="Search:", style="ToolbarLabel.TLabel").pack(
@@ -285,12 +806,48 @@ class App:
         self.search_var = tk.StringVar(value="")
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
         search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        search_entry.bind("<Return>", lambda _e: self._on_search_changed())
         ttk.Button(
             search_frame, text="Clear", style="PanelAction.TButton",
             command=lambda: self.search_var.set("")).pack(side=tk.LEFT, padx=(4, 0))
-        self.search_var.trace_add("write", self._on_search_changed)
+        self.search_var.trace_add(
+            "write", lambda *_a: self._on_search_typed(
+                "main", self.search_var, self._on_search_changed))
+
+    # -- search mode (Live vs. On Enter), shared by both search bars ------
+    def _search_mode_label(self):
+        """Text for the search-mode toggle button ("Live" or "On Enter")."""
+        return "Live" if self.search_mode == "live" else "On Enter"
+
+    def _toggle_search_mode(self):
+        """Switch both search bars between Live (search as you type) and On
+        Enter (search only when Enter is pressed); saved with the session."""
+        self.search_mode = "enter" if self.search_mode == "live" else "live"
+        if hasattr(self, "search_mode_button"):
+            self.search_mode_button.configure(text=self._search_mode_label())
+        self.status_var.set(
+            "Search mode: live (searches as you type)"
+            if self.search_mode == "live"
+            else "Search mode: on Enter (press Enter to search)")
+
+    def _on_search_typed(self, key, var, run_search):
+        """Text changed in a search box: in Live mode, run the search
+        shortly after typing pauses (debounced, so it doesn't run on every
+        keystroke); in On Enter mode, wait for Enter. Clearing the box
+        always resets the search immediately."""
+        job = self._search_debounce_jobs.pop(key, None)
+        if job is not None:
+            self.root.after_cancel(job)
+        if not var.get().strip():
+            run_search()
+        elif self.search_mode == "live":
+            self._search_debounce_jobs[key] = self.root.after(
+                250, lambda: (self._search_debounce_jobs.pop(key, None),
+                              run_search()))
 
     def _on_search_changed(self, *_args):
+        """Run the main search: refilter the playlist table, highlight the
+        library folders that contain matches, and report the match count."""
         self.search_query = self.search_var.get().strip().lower()
         self._refresh_playlist_view()
         if not self.search_query:
@@ -305,6 +862,8 @@ class App:
             f"Search '{self.search_query}': {len(matched_paths)} {noun}")
 
     def _matches_search(self, path):
+        """True if track `path` matches the main search text (case-insensitive
+        substring of its artist, title, album or file name)."""
         if not self.search_query:
             return True
         tags = self.track_tags.get(path, {})
@@ -316,6 +875,10 @@ class App:
 
     # -- now playing bar --------------------------------------------------
     def _build_now_playing_bar(self):
+        """The bottom Now Playing bar: album art (the spinning disc), the right-
+        side skip-buttons box, the title/artist labels, the Play/Pause, Stop,
+        Add to Queue, Shuffle and Repeat buttons, and the progress bar with
+        elapsed/total time."""
         frame = ttk.Frame(self.root, relief=tk.RIDGE, borderwidth=1, padding=8)
         frame.pack(side=tk.BOTTOM, fill=tk.X)
 
@@ -387,13 +950,10 @@ class App:
         ttk.Label(progress_row, textvariable=self.duration_var, width=6,
                   style="ProgressTime.TLabel").pack(side=tk.LEFT)
 
-    # -- right-side skip-buttons box (+ optional background photo) --------
+    # -- right-side skip-buttons box --------------------------------------
     def _build_right_box(self, parent):
         """A box on the right side of the Now Playing bar containing its own
-        Previous/Next buttons (mirroring the toolbar's |<< / >>| buttons),
-        with an optional user-uploaded background photo shown at low
-        opacity behind those buttons. The "Set Background..." button sits
-        below that box (not part of the image itself)."""
+        Previous/Next buttons (mirroring the toolbar's |<< / >>| buttons)."""
         self.right_box_width = 170
         self.right_box_height = 54
 
@@ -402,18 +962,12 @@ class App:
 
         style = ttk.Style()
         bg_color = style.lookup("TFrame", "background") or "#f0f0f0"
-        self.right_box_base_color = self._rgb_of(bg_color)
 
         canvas = tk.Canvas(container, width=self.right_box_width,
                            height=self.right_box_height,
                            highlightthickness=0, bd=0, bg=bg_color)
         canvas.pack(side=tk.TOP)
-        canvas.bind("<Button-3>", self._on_right_box_right_click)
         self.right_box_canvas = canvas
-        self.right_box_bg_item = None
-        self.right_box_bg_photo = None
-        self.right_box_bg_source_image = None
-        self.right_box_bg_path = None
 
         nav_row = ttk.Frame(canvas)
         ttk.Button(nav_row, text="|<<", width=4, style="NavBox.TButton",
@@ -424,11 +978,8 @@ class App:
                              self.right_box_height // 2,
                              anchor=tk.CENTER, window=nav_row)
 
-        ttk.Button(container, text="Set Background...", style="PanelAction.TButton",
-                   command=self._choose_right_box_background).pack(
-            side=tk.TOP, fill=tk.X, pady=(4, 0))
-
     def _rgb_of(self, color):
+        """Convert any Tk color (name or #hex) to an (r, g, b) tuple of 0-255."""
         r, g, b = self.root.winfo_rgb(color)
         return (r >> 8, g >> 8, b >> 8)
 
@@ -452,6 +1003,7 @@ class App:
 
     @staticmethod
     def _blend_rgb(start_rgb, end_rgb, ratio):
+        """Linearly mix two (r, g, b) colors; ratio 0 = start, 1 = end."""
         return tuple(
             round(start + (end - start) * ratio)
             for start, end in zip(start_rgb, end_rgb))
@@ -466,6 +1018,8 @@ class App:
     # cleanly from full color instead of stacking/racing.
     def _animate_color_fade(self, key, apply_color, start_color, end_color,
                             delay_ms=0, total_steps=14, step_ms=30, on_complete=None):
+        """Start (or restart) a fade of a widget color from `start_color` to
+        `end_color`; see the section comment above for details."""
         existing = self._fade_jobs.pop(key, None)
         if existing is not None:
             self.root.after_cancel(existing)
@@ -479,6 +1033,8 @@ class App:
 
     def _step_color_fade(self, key, apply_color, start_rgb, end_rgb, step,
                          total_steps, step_ms, on_complete):
+        """One step of _animate_color_fade: apply the next in-between color and
+        schedule the following step, calling `on_complete` after the last."""
         if step >= total_steps:
             self._fade_jobs.pop(key, None)
             if on_complete:
@@ -511,58 +1067,260 @@ class App:
             delay_ms=2000,
             on_complete=lambda: self.viewing_folder_var.set(""))
 
-    def _on_right_box_right_click(self, event):
-        menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
-        menu.add_command(label="Set Background Image...",
-                         command=self._choose_right_box_background)
-        menu.add_command(
-            label="Clear Background",
-            command=self._clear_right_box_background,
-            state=tk.NORMAL if self.right_box_bg_item is not None else tk.DISABLED)
-        self._popup_menu(menu, event)
-
-    def _choose_right_box_background(self):
-        path = filedialog.askopenfilename(
-            title="Choose a background image", filetypes=IMAGE_FILETYPES)
-        if not path:
+    # -- dark mode / theming ---------------------------------------------
+    def _apply_title_bar_colors(self, palette, window=None):
+        """Color the native window title bar ("Playerton" + minimize/
+        maximize/close) to match the theme, via the Windows 11 DWM caption
+        color attributes. Silently does nothing on other platforms or
+        older Windows versions that don't support them."""
+        if sys.platform != "win32":
             return
         try:
-            image = Image.open(path)
+            import ctypes
+            window = window or self.root
+            window.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            if not hwnd:
+                return
+            dwm = ctypes.windll.dwmapi
+
+            def set_attr(attribute, value):
+                """Set one integer DWM window attribute on the title bar."""
+                data = ctypes.c_int(value)
+                dwm.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(data), ctypes.sizeof(data))
+
+            def colorref(color):  # Windows wants 0x00BBGGRR
+                """Convert a Tk color to the 0x00BBGGRR integer Windows expects."""
+                r, g, b = self._rgb_of(color)
+                return r | (g << 8) | (b << 16)
+
+            # DWMWA_USE_IMMERSIVE_DARK_MODE (light/dark caption buttons).
+            r, g, b = self._rgb_of(palette["bg"])
+            set_attr(20, int(0.299 * r + 0.587 * g + 0.114 * b < 128))
+            set_attr(35, colorref(palette["bg"]))  # DWMWA_CAPTION_COLOR
+            set_attr(36, colorref(palette["fg"]))  # DWMWA_TEXT_COLOR
+            set_attr(34, colorref(palette["bg"]))  # DWMWA_BORDER_COLOR
         except Exception as exc:
-            self.status_var.set(f"Could not load image: {exc}")
+            logger.debug("Could not theme title bar: %s", exc)
+
+    def _apply_named_fonts(self, palette):
+        """Point Tk's named default fonts at the theme's font family/size
+        offset (or back to their originals), so widgets without a
+        STYLESHEET font -- menus, entries, the menu bar -- follow too."""
+        family_override = palette.get("font_family") or ""
+        try:
+            offset = int(palette.get("font_size_offset", 0) or 0)
+        except (TypeError, ValueError):
+            offset = 0
+        for name, (family, size) in self._named_font_defaults.items():
+            # Negative Tk sizes are pixels; grow them in the same direction.
+            new_size = size - offset if size < 0 else max(6, size + offset)
+            try:
+                tkfont.nametofont(name).configure(
+                    family=family_override or family, size=new_size)
+            except tk.TclError:
+                pass
+
+    FONTS_DIR = os.path.join(CACHE_DIR, "fonts")
+    FONT_FILETYPES = [("Font files", "*.ttf *.otf *.ttc"), ("All files", "*.*")]
+
+    def _register_font_file(self, path):
+        """Load a font file for this process only (Windows GDI private
+        font), returning the set of newly available family names."""
+        if sys.platform != "win32":
+            return set()
+        import ctypes
+        before = set(tkfont.families(self.root))
+        FR_PRIVATE = 0x10
+        if not ctypes.windll.gdi32.AddFontResourceExW(path, FR_PRIVATE, 0):
+            return set()
+        return set(tkfont.families(self.root)) - before
+
+    def _register_imported_fonts(self):
+        """Load every font file previously imported through the theme editor
+        (stored in FONTS_DIR) so they're available again this launch."""
+        if not os.path.isdir(self.FONTS_DIR):
             return
-        self.right_box_bg_source_image = image
-        self.right_box_bg_path = path
-        self._set_right_box_background(image)
-        self.status_var.set(f"Set background image: {os.path.basename(path)}")
+        for name in sorted(os.listdir(self.FONTS_DIR)):
+            if name.lower().endswith((".ttf", ".otf", ".ttc")):
+                try:
+                    self._register_font_file(os.path.join(self.FONTS_DIR, name))
+                except Exception as exc:
+                    logger.warning("Could not load font %s: %s", name, exc)
 
-    def _clear_right_box_background(self):
-        self.right_box_bg_source_image = None
-        self.right_box_bg_path = None
-        if self.right_box_bg_item is not None:
-            self.right_box_canvas.delete(self.right_box_bg_item)
-            self.right_box_bg_item = None
-            self.right_box_bg_photo = None
-        self.status_var.set("Cleared background image")
+    def import_font_file(self, parent=None):
+        """Ask for a .ttf/.otf font file, copy it into FONTS_DIR (so it's
+        still there next launch) and load it. Returns the font's family
+        name, or None if cancelled/failed."""
+        path = filedialog.askopenfilename(
+            title="Import font", filetypes=self.FONT_FILETYPES,
+            parent=parent or self.root)
+        if not path:
+            return None
+        if sys.platform != "win32":
+            self.status_var.set(
+                "Importing fonts is only supported on Windows -- install the "
+                "font on your system instead")
+            return None
+        try:
+            os.makedirs(self.FONTS_DIR, exist_ok=True)
+            dest = os.path.join(self.FONTS_DIR, os.path.basename(path))
+            if os.path.normcase(os.path.abspath(path)) != os.path.normcase(dest):
+                dest = self._unique_destination(dest) if os.path.exists(dest) else dest
+                shutil.copy2(path, dest)
+            new_families = self._register_font_file(dest)
+        except Exception as exc:
+            self.status_var.set(f"Could not import font: {exc}")
+            return None
+        family = None
+        try:
+            from PIL import ImageFont
+            family = ImageFont.truetype(dest).getname()[0]
+        except Exception:
+            pass
+        if new_families and family not in new_families:
+            family = sorted(new_families, key=len)[0]
+        if not family:
+            self.status_var.set(
+                f"Could not read a font family from {os.path.basename(path)}")
+            return None
+        self.status_var.set(f"Imported font: {family}")
+        return family
 
-    def _set_right_box_background(self, image):
-        fitted = fit_image_cover(
-            image, (self.right_box_width, self.right_box_height))
-        faded = apply_low_opacity(
-            fitted, opacity=0.25, base_color=self.right_box_base_color)
-        self.right_box_bg_photo = ImageTk.PhotoImage(faded)
-        if self.right_box_bg_item is None:
-            self.right_box_bg_item = self.right_box_canvas.create_image(
-                0, 0, anchor=tk.NW, image=self.right_box_bg_photo)
-            # create_window'd widgets always paint above plain canvas items
-            # in Tk regardless of stacking order, but push it to the back
-            # explicitly anyway for clarity/future-proofing.
-            self.right_box_canvas.tag_lower(self.right_box_bg_item)
+    def set_custom_theme_font(self, family=None, size_offset=None):
+        """Change the font family and/or size offset (theme editor). These are
+        stored on the Custom theme but applied to every theme, so the active
+        theme is kept and simply re-applied."""
+        custom = THEMES[CUSTOM_THEME_NAME]
+        if family is not None:
+            custom["font_family"] = family
+        if size_offset is not None:
+            custom["font_size_offset"] = max(-4, min(12, size_offset))
+        # Fonts apply to whichever theme is active, so no theme switch.
+        self._apply_theme()
+
+    @staticmethod
+    def _is_hex_color(value):
+        """True if `value` is a "#rrggbb" color string."""
+        return isinstance(value, str) and re.fullmatch(
+            r"#[0-9a-fA-F]{6}", value) is not None
+
+    # -- equalizer -------------------------------------------------------------
+    def open_equalizer(self):
+        """Settings > "Equalizer...": open (or raise) the EQ window."""
+        if self.eq_window is not None:
+            self.eq_window.window.deiconify()
+            self.eq_window.window.lift()
+            return
+        self.eq_window = EqualizerWindow(self)
+
+    def all_eq_presets(self):
+        """Built-in presets followed by the user's own, as {name: gains}."""
+        presets = dict(EQ_PRESETS)
+        presets.update(self.eq_custom_presets)
+        return presets
+
+    def set_eq(self, enabled=None, gains=None, preset=...):
+        """Change the EQ: on/off, band gains, and/or which preset is
+        selected (None = hand-edited). Applies to the audio immediately
+        (gain changes crossfade in without a click) and is saved with the
+        session."""
+        if enabled is not None:
+            self.eq_enabled = bool(enabled)
+        if gains is not None:
+            self.eq_gains = clamp_gains(gains)
+        if preset is not ...:
+            self.eq_preset = preset
+        self.audio.set_eq(self.eq_enabled, self.eq_gains)
+        if self.eq_window is not None:
+            self.eq_window.refresh()
+
+    def eq_status_text(self):
+        """One-line description of what the EQ is doing right now."""
+        if not self.eq_enabled:
+            return "Equalizer off"
+        name = self.eq_preset or "Custom (unsaved)"
+        if self.audio.path and self.audio._playing and not self.audio.eq_active():
+            error = self.audio.last_eq_error
+            ext = os.path.splitext(self.audio.path)[1].lower() or "this file"
+            why = f"{ext} isn't supported" if error is None else f"unavailable ({error})"
+            return f"Equalizer on: {name} -- not applied to this track ({why})"
+        return f"Equalizer on: {name}"
+
+    def open_theme_editor(self):
+        """View > "Edit Custom Theme...": a window listing every palette
+        color (the same keys every theme in styles.py defines, which the
+        STYLESHEET rules refer to), applied live as you change them."""
+        if self.theme_editor is not None:
+            self.theme_editor.window.deiconify()
+            self.theme_editor.window.lift()
+            return
+        # No theme switch here: the font settings apply to every theme, so
+        # the font can be changed while keeping e.g. Sunset. Editing a
+        # color (set_custom_theme_color) switches to the Custom theme.
+        self.theme_editor = ThemeEditor(self)
+
+    def set_custom_theme_color(self, key, color):
+        """Set one palette color of the Custom theme (theme editor) and apply
+        it live, switching to the Custom theme if another one is active."""
+        THEMES[CUSTOM_THEME_NAME][key] = color
+        if self.theme_name != CUSTOM_THEME_NAME or self.match_bg_colors_var.get():
+            self.set_theme(CUSTOM_THEME_NAME)
         else:
-            self.right_box_canvas.itemconfig(
-                self.right_box_bg_item, image=self.right_box_bg_photo)
+            self._apply_theme()
 
-    # -- dark mode / theming ---------------------------------------------
+    def load_custom_theme_from(self, theme_name):
+        """Theme editor "Start from": copy a built-in theme's colors into the
+        Custom theme (the font settings are left alone) and switch to it."""
+        # Copies the preset's colors; the custom font settings are kept.
+        THEMES[CUSTOM_THEME_NAME].update(
+            {key: THEMES[theme_name][key] for key in PALETTE_KEYS})
+        self.set_theme(CUSTOM_THEME_NAME)
+        self.status_var.set(
+            f"Custom theme reset to {theme_name.replace('_', ' ').title()}")
+
+    def _active_palette(self):
+        """The active colors (see _active_color_palette) plus the font
+        settings from the theme editor, which apply to EVERY theme --
+        built-in, Custom, or image-matched -- not just Custom."""
+        palette = dict(self._active_color_palette())
+        custom = THEMES[CUSTOM_THEME_NAME]
+        for key in FONT_KEYS:
+            if key in custom:
+                palette[key] = custom[key]
+        return palette
+
+    def _active_color_palette(self):
+        """The image-matched palette when Settings > "Match Player Colors
+        to Background Image" is on and a playlist background is set,
+        otherwise the selected View theme."""
+        if (self.match_bg_colors_var.get()
+                and getattr(self, "playlist_bg_source_image", None) is not None):
+            if self._image_palette is None:
+                try:
+                    self._image_palette = palette_from_image(
+                        self.playlist_bg_source_image)
+                except Exception as exc:
+                    logger.warning("Could not build image palette: %s", exc)
+                    return THEMES[self.theme_name]
+            return self._image_palette
+        return THEMES[self.theme_name]
+
+    def _on_toggle_match_bg_colors(self):
+        """Settings > "Match Player Colors to Background Image" toggled:
+        re-apply the theme (image palette or normal theme) and say what
+        happened in the status bar."""
+        enabled = self.match_bg_colors_var.get()
+        self._apply_theme()
+        if not enabled:
+            self.status_var.set("Player colors: theme")
+        elif self.playlist_bg_source_image is None:
+            self.status_var.set(
+                "Set a playlist background image to match colors to it")
+        else:
+            self.status_var.set("Player colors matched to background image")
+
     def _menu_colors(self):
         """Keyword args to apply the current palette to a tk.Menu."""
         palette = self.palette
@@ -573,8 +1331,12 @@ class App:
         )
 
     def set_theme(self, theme_name):
+        """View menu theme pick: make `theme_name` the active theme. Picking a
+        theme explicitly turns off image-matched colors."""
         self.theme_name = theme_name
         self.theme_var.set(theme_name)
+        # Explicitly picking a theme overrides image-matched colors.
+        self.match_bg_colors_var.set(False)
         self._apply_theme()
         self.status_var.set(f"Theme: {theme_name.replace('_', ' ').title()}")
 
@@ -586,7 +1348,7 @@ class App:
         plain tk widget directly (menus, canvases, and the playlist
         background photo are handled separately below since they need
         logic beyond "set these properties")."""
-        palette = THEMES[self.theme_name]
+        palette = self._active_palette()
         self.palette = palette
 
         # Cancel any in-flight fade animation (now-playing title/artist,
@@ -609,8 +1371,14 @@ class App:
         style.configure(
             ".", background=palette["bg"], foreground=palette["fg"])
 
+        self._apply_named_fonts(palette)
         for selector, props in STYLESHEET.items():
             resolved = resolve_style(props, palette)
+            if "rowheight" in resolved and "font" in resolved:
+                # Grow table rows to fit a bigger/taller custom font.
+                linespace = tkfont.Font(
+                    root=self.root, font=resolved["font"]).metrics("linespace")
+                resolved["rowheight"] = max(resolved["rowheight"], linespace + 6)
             if selector.startswith("#"):
                 widget = getattr(self, selector[1:], None)
                 if widget is not None:
@@ -630,6 +1398,9 @@ class App:
         # live on the widget instance, not the ttk style, so they need to
         # be reapplied whenever the theme changes).
         if hasattr(self, "library_tree"):
+            self.library_tree.tag_configure(
+                "search_match", background=palette["queue_bg"],
+                foreground=palette["queue_fg"])
             self.library_tree.tag_configure(
                 "filter_match", background=palette["highlight_bg"],
                 foreground=palette["highlight_fg"])
@@ -670,18 +1441,22 @@ class App:
             self.viewing_folder_label.configure(foreground=palette["fg"])
 
         self.root.configure(bg=palette["bg"])
+        self._apply_title_bar_colors(palette)
 
         menu_colors = self._menu_colors()
         if hasattr(self, "menu_bar"):
             self.menu_bar.configure(**menu_colors)
+        self._apply_menu_bar_theme()
+        if self.theme_editor is not None:
+            self.theme_editor.apply_palette(palette)
+        if getattr(self, "eq_window", None) is not None:
+            self.eq_window.apply_palette(palette)
+        self._apply_lyrics_theme(palette)
         for menu in getattr(self, "_top_menus", []):
             menu.configure(**menu_colors)
 
         if hasattr(self, "right_box_canvas"):
             self.right_box_canvas.configure(bg=palette["bg"])
-            self.right_box_base_color = self._rgb_of(palette["bg"])
-            if self.right_box_bg_source_image is not None:
-                self._set_right_box_background(self.right_box_bg_source_image)
 
         if getattr(self, "_current_art_pil", None) is not None:
             # Rebuild the Now Playing "spinning disk" so its corner-fill
@@ -708,7 +1483,12 @@ class App:
 
     # -- library (left) + playlist (center) ----------------------------
     def _build_body(self):
+        """The main area: a resizable split with the library folder tree (plus
+        its search/collapse tools) and the queue panel on the left, and the
+        playlist table (with its background-photo buttons and the transient
+        "Currently viewing folder" label) on the right."""
         body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.body_pane = body
         body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         # Left: media library ("file explorer") on top, queue panel below
@@ -717,6 +1497,7 @@ class App:
         library_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         library_tree_frame = ttk.Frame(library_pane)
+        self._build_library_tools(library_tree_frame)
         self.library_tree = ttk.Treeview(
             library_tree_frame, show="tree", style="Library.Treeview")
         lib_scroll = ttk.Scrollbar(
@@ -782,6 +1563,12 @@ class App:
         self.playlist_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         body.add(playlist_frame, weight=3)
 
+        # Right: lyrics panel (shown/hidden via View > Show Lyrics Panel).
+        self.lyrics_frame = ttk.Frame(body, width=300)
+        self._build_lyrics_panel(self.lyrics_frame)
+        if self.show_lyrics_var.get():
+            body.add(self.lyrics_frame, weight=1)
+
         self.playlist_tree.bind("<Double-1>", self._on_tree_double_click)
         self.playlist_tree.bind("<Button-3>", self._on_tree_right_click)
         self.playlist_tree.bind(
@@ -796,8 +1583,339 @@ class App:
             tree.bind("<B1-Motion>", self._on_drag_motion, add="+")
             tree.bind("<ButtonRelease-1>", self._on_drag_release, add="+")
 
+    # -- library panel tools: search + collapse/expand all ---------------
+    def _build_library_tools(self, parent):
+        """Search box (with Live / On Enter mode toggle) and Collapse All /
+        Expand All buttons above the library folder tree."""
+        tools = ttk.Frame(parent)
+        tools.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+
+        search_row = ttk.Frame(tools)
+        search_row.pack(side=tk.TOP, fill=tk.X)
+        self.library_search_var = tk.StringVar(value="")
+        entry = ttk.Entry(search_row, textvariable=self.library_search_var)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # Enter searches (On Enter mode) / jumps to the next match.
+        entry.bind("<Return>", lambda _e: self._on_library_search_enter())
+        entry.bind("<Escape>", lambda _e: self.library_search_var.set(""))
+        self.search_mode_button = ttk.Button(
+            search_row, text=self._search_mode_label(), width=8,
+            style="PanelAction.TButton", command=self._toggle_search_mode)
+        self.search_mode_button.pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Button(search_row, text="X", width=2, style="PanelAction.TButton",
+                   command=lambda: self.library_search_var.set("")).pack(
+            side=tk.LEFT, padx=(2, 0))
+        self.library_search_var.trace_add(
+            "write", lambda *_a: self._on_search_typed(
+                "library", self.library_search_var, self._run_library_search))
+
+        button_row = ttk.Frame(tools)
+        button_row.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+        ttk.Button(button_row, text="Collapse All", style="PanelAction.TButton",
+                   command=self.collapse_all_library).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
+        ttk.Button(button_row, text="Expand All", style="PanelAction.TButton",
+                   command=self.expand_all_library).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 0))
+
+    def _all_library_items(self, parent=""):
+        """Yield every item id in the library tree under `parent`, depth-first."""
+        for child in self.library_tree.get_children(parent):
+            yield child
+            yield from self._all_library_items(child)
+
+    def collapse_all_library(self):
+        """Collapse All button: close every folder in the library tree."""
+        for item in self._all_library_items():
+            self.library_tree.item(item, open=False)
+        self.status_var.set("Collapsed all folders")
+
+    def expand_all_library(self):
+        """Expand All button: open every folder (that has children) in the
+        library tree."""
+        for item in self._all_library_items():
+            if self.library_tree.get_children(item):
+                self.library_tree.item(item, open=True)
+        self.status_var.set("Expanded all folders")
+
+    def _clear_library_search_marks(self):
+        """Remove the "search_match" highlight from the previous library search
+        results (keeping any other tags, e.g. "ignored")."""
+        for item in self._library_search_matches:
+            if self.library_tree.exists(item):
+                tags = tuple(t for t in self.library_tree.item(item, "tags")
+                             if t != "search_match")
+                self.library_tree.item(item, tags=tags)
+        self._library_search_matches = []
+        self._library_search_index = -1
+
+    def _library_item_matches(self, item, query):
+        """True if library tree item `item` matches `query`: its displayed name,
+        plus artist/title/album for tracks."""
+        haystack = str(self.library_tree.item(item, "text"))
+        tags = self.track_tags.get(item)
+        if tags:
+            haystack += " " + " ".join(
+                (tags.get("artist", ""), tags.get("title", ""),
+                 tags.get("album", "")))
+        return query in haystack.lower()
+
+    def _run_library_search(self):
+        """Find library folders/tracks matching the library search box.
+        Everything else is collapsed and only the branches leading to a
+        match are opened, so a search never leaves unrelated folders
+        expanded. A folder whose name matches hides its own contents'
+        matches (they'd just be noise underneath it)."""
+        query = self.library_search_var.get().strip().lower()
+        self._clear_library_search_marks()
+        self._library_search_last_query = query
+        if not query:
+            return
+
+        matches = []
+        def walk(parent):
+            """Collect matches under `parent`, not descending into an item that
+            matches itself."""
+            for child in self.library_tree.get_children(parent):
+                if self._library_item_matches(child, query):
+                    matches.append(child)
+                else:
+                    walk(child)
+        walk("")
+
+        for item in self._all_library_items():
+            self.library_tree.item(item, open=False)
+        for item in matches:
+            tags = tuple(self.library_tree.item(item, "tags")) + ("search_match",)
+            self.library_tree.item(item, tags=tags)
+            ancestor = self.library_tree.parent(item)
+            while ancestor:
+                self.library_tree.item(ancestor, open=True)
+                ancestor = self.library_tree.parent(ancestor)
+        self._library_search_matches = matches
+
+        if matches:
+            self._jump_to_library_match(0)
+        noun = "match" if len(matches) == 1 else "matches"
+        self.status_var.set(
+            f"Library search '{query}': {len(matches)} {noun}"
+            + (" (Enter = next)" if len(matches) > 1 else ""))
+
+    def _jump_to_library_match(self, index):
+        """Scroll to, select and focus the library search match number `index`."""
+        self._library_search_index = index
+        item = self._library_search_matches[index]
+        self.library_tree.see(item)
+        self.library_tree.selection_set(item)
+        self.library_tree.focus(item)
+
+    def _on_library_search_enter(self):
+        """Enter in the library search box: run the search if the text
+        changed since the last search, otherwise step to the next match."""
+        query = self.library_search_var.get().strip().lower()
+        if query != self._library_search_last_query or not self._library_search_matches:
+            job = self._search_debounce_jobs.pop("library", None)
+            if job is not None:
+                self.root.after_cancel(job)
+            self._run_library_search()
+        else:
+            nxt = (self._library_search_index + 1) % len(self._library_search_matches)
+            self._jump_to_library_match(nxt)
+            self.status_var.set(
+                f"Match {nxt + 1} of {len(self._library_search_matches)}")
+
+    # -- lyrics panel (right side) ------------------------------------------
+    def _build_lyrics_panel(self, parent):
+        """The lyrics panel: a header (title + where the lyrics came from)
+        and a read-only, word-wrapped, centered text view. Synced lyrics
+        highlight the line being sung and keep it centered; clicking a line
+        jumps the song to it."""
+        header = ttk.Frame(parent)
+        header.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(header, text="Lyrics", style="QueueHeader.TLabel").pack(
+            side=tk.LEFT, padx=4, pady=2)
+        self.lyrics_source_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.lyrics_source_var).pack(
+            side=tk.RIGHT, padx=4)
+
+        body = ttk.Frame(parent)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.lyrics_text = tk.Text(
+            body, wrap=tk.WORD, bd=0, highlightthickness=0, padx=12, pady=12,
+            cursor="arrow", spacing1=2, spacing3=6, width=34)
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL,
+                               command=self.lyrics_text.yview)
+        self.lyrics_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.lyrics_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.lyrics_text.tag_configure("center", justify=tk.CENTER)
+        self.lyrics_text.bind("<Button-1>", self._on_lyrics_click)
+        self._show_lyrics_message("Play a song to see its lyrics.")
+
+    def _apply_lyrics_theme(self, palette):
+        """Colors/fonts of the lyrics view: plain lines slightly dimmed, the
+        current synced line in full color, bold and a bit bigger."""
+        if not hasattr(self, "lyrics_text"):
+            return
+        dim = "#%02x%02x%02x" % self._blend_rgb(
+            self._rgb_of(palette["field_fg"]), self._rgb_of(palette["field_bg"]), 0.35)
+        self.lyrics_text.configure(
+            bg=palette["field_bg"], fg=palette["field_fg"],
+            font=resolve_font(FONTS["lyrics"], palette),
+            selectbackground=palette["field_bg"], inactiveselectbackground=palette["field_bg"])
+        self.lyrics_text.tag_configure("dim", foreground=dim)
+        self.lyrics_text.tag_configure(
+            "current", foreground=palette["field_fg"],
+            font=resolve_font(FONTS["lyrics_current"], palette))
+        self.lyrics_text.tag_raise("current")
+
+    def _on_toggle_lyrics_panel(self):
+        """View > Show Lyrics Panel: add/remove the panel (and load lyrics
+        for the current track when it's shown)."""
+        if self.show_lyrics_var.get():
+            self.body_pane.add(self.lyrics_frame, weight=1)
+            path = self._current_playing_path()
+            if path and path != self._lyrics_path:
+                self._load_lyrics(path)
+        else:
+            self.body_pane.forget(self.lyrics_frame)
+
+    def _on_toggle_online_lyrics(self):
+        """Settings > Fetch Lyrics Online toggled: confirm, and look the
+        current song up now if it has no local lyrics."""
+        enabled = self.online_lyrics_var.get()
+        self.status_var.set("Online lyrics (LRCLIB): " + ("on" if enabled else "off"))
+        path = self._current_playing_path()
+        if enabled and path and self._lyrics is None:
+            self._load_lyrics(path)
+
+    def _load_lyrics(self, path):
+        """Find lyrics for `path`: local ones right away (sidecar .lrc or
+        embedded tags), else -- if enabled and the panel is visible -- an
+        LRCLIB lookup on a background thread, whose result is picked up by
+        _poll_lyrics_queue. A newer call (track change) wins over an older
+        lookup still in flight, via `_lyrics_token`."""
+        self._lyrics_token += 1
+        token = self._lyrics_token
+        self._lyrics_path = path
+        self._lyrics = None
+        lyrics = find_local_lyrics(path)
+        if lyrics is not None:
+            self._show_lyrics(lyrics)
+            return
+        if not (self.online_lyrics_var.get() and self.show_lyrics_var.get()):
+            self._show_lyrics_message(
+                "No lyrics found for this song."
+                + ("" if self.online_lyrics_var.get()
+                   else "\n\n(Online lookup is off -- Settings > Fetch Lyrics Online.)"))
+            return
+        tags = self.track_tags.get(path) or {}
+        artist = tags.get("artist") or ""
+        title = tags.get("title") or ""
+        album = tags.get("album") or ""
+        duration = self.current_duration or 0
+        self._show_lyrics_message("Searching LRCLIB...", source="")
+
+        def work():
+            try:
+                result = fetch_online_lyrics(artist, title, album, duration)
+                self._lyrics_queue.put((token, result, None))
+            except Exception as exc:
+                self._lyrics_queue.put((token, None, exc))
+
+        threading.Thread(target=work, name="lyrics-lookup", daemon=True).start()
+        self.root.after(100, self._poll_lyrics_queue)
+
+    def _poll_lyrics_queue(self):
+        """Main thread: check for a finished online lookup (Tk widgets must
+        only be touched here, never from the worker thread)."""
+        try:
+            token, result, error = self._lyrics_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(100, self._poll_lyrics_queue)
+            return
+        if token != self._lyrics_token:
+            return  # an older lookup for a track that's no longer playing
+        if error is not None:
+            logger.warning("Lyrics lookup failed: %r", error)
+            self._show_lyrics_message("Couldn't reach LRCLIB to look up lyrics.")
+        elif result is None:
+            self._show_lyrics_message("No lyrics found for this song.")
+        else:
+            self._show_lyrics(result)
+
+    def _show_lyrics_message(self, message, source=""):
+        """Show a status message (no lyrics / searching...) in the panel."""
+        self._lyrics = None
+        self._lyrics_current_line = None
+        self.lyrics_source_var.set(source)
+        text = self.lyrics_text
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        text.insert("1.0", message, ("center", "dim"))
+        text.configure(state=tk.DISABLED)
+
+    def _show_lyrics(self, lyrics):
+        """Fill the panel with `lyrics`: one centered row per synced line
+        (all dimmed until sung), or the plain text as-is."""
+        self._lyrics = lyrics
+        self._lyrics_current_line = None
+        self.lyrics_source_var.set(
+            lyrics.source + (" \u00b7 synced" if lyrics.synced else ""))
+        text = self.lyrics_text
+        text.configure(state=tk.NORMAL)
+        text.delete("1.0", tk.END)
+        if lyrics.synced:
+            body = "\n".join(line or "\u266a" for _t, line in lyrics.lines)
+            text.insert("1.0", body, ("center", "dim"))
+        else:
+            text.insert("1.0", lyrics.text, ("center",))
+        text.configure(state=tk.DISABLED)
+        text.yview_moveto(0)
+        if lyrics.synced and self.is_playing:
+            elapsed = self.elapsed_before_pause
+            if not self.is_paused and self.play_started_monotonic:
+                elapsed += time.monotonic() - self.play_started_monotonic
+            self._update_lyrics_position(elapsed)
+
+    def _update_lyrics_position(self, seconds):
+        """Highlight the synced line being sung at `seconds` and scroll it to
+        the middle of the panel (cheap no-op when the line hasn't changed)."""
+        lyrics = self._lyrics
+        if lyrics is None or not lyrics.synced:
+            return
+        index = lyrics.line_index_at(seconds)
+        if index == self._lyrics_current_line:
+            return
+        self._lyrics_current_line = index
+        text = self.lyrics_text
+        text.tag_remove("current", "1.0", tk.END)
+        if index < 0:
+            text.yview_moveto(0)
+            return
+        line = index + 1  # Text widget lines are 1-based
+        text.tag_add("current", f"{line}.0", f"{line}.end")
+        # Center the line: scroll so it sits half a panel below the top.
+        total = len(lyrics.lines)
+        visible = max(1, text.winfo_height() // max(1, tkfont.Font(
+            font=text.cget("font")).metrics("linespace") + 8))
+        text.yview_moveto(max(0.0, (line - 1 - visible / 2) / max(1, total)))
+
+    def _on_lyrics_click(self, event):
+        """Clicking a synced line jumps the song to that line."""
+        lyrics = self._lyrics
+        if (lyrics is None or not lyrics.synced or not self.is_playing
+                or self._lyrics_path != self._current_playing_path()):
+            return
+        line = int(self.lyrics_text.index(f"@{event.x},{event.y}").split(".")[0])
+        if 1 <= line <= len(lyrics.lines):
+            self._seek_to(lyrics.lines[line - 1][0])
+
     # -- queue panel (bottom half of the library/"file explorer" side) ---
     def _build_queue_panel(self, parent):
+        """The Queue panel under the library tree: a Title/Artist table of the
+        tracks queued to play next, with Clear, Up, Down and Remove buttons,
+        a right-click menu, double-click to play, and drag to reorder."""
         header = ttk.Frame(parent)
         header.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(header, text="Queue", style="QueueHeader.TLabel").pack(
@@ -877,6 +1995,8 @@ class App:
             self.playlist_tree.item(item, tags=tuple(new_tags))
 
     def _selected_queue_index(self):
+        """Index in player.queue of the selected queue row (row ids are the
+        indexes as strings), or None if nothing is selected."""
         selection = self.queue_tree.selection()
         if not selection:
             return None
@@ -886,6 +2006,7 @@ class App:
             return None
 
     def _move_queue_selection(self, delta):
+        """Move the selected queued track up (delta=-1) or down (delta=1)."""
         index = self._selected_queue_index()
         if index is None:
             return
@@ -899,6 +2020,7 @@ class App:
         self.queue_tree.focus(str(new_index))
 
     def _remove_queue_selection(self):
+        """Remove the selected track from the queue."""
         index = self._selected_queue_index()
         if index is None:
             return
@@ -906,6 +2028,7 @@ class App:
         self._refresh_queue_view()
 
     def _clear_queue(self):
+        """Empty the queue."""
         self.player.queue.clear()
         self._refresh_queue_view()
         self.status_var.set("Cleared queue")
@@ -920,12 +2043,15 @@ class App:
         self._play_track(path, from_queue=True)
 
     def _on_queue_double_click(self, event):
+        """Double-clicking a queue row plays that track right away."""
         row = self.queue_tree.identify_row(event.y)
         if not row:
             return
         self._play_queue_index(int(row))
 
     def _on_queue_right_click(self, event):
+        """Right-click menu for a queue row: Play Now, Move Up/Down, Remove,
+        Clear Selection, Clear Queue."""
         row = self.queue_tree.identify_row(event.y)
         if not row:
             return
@@ -959,10 +2085,13 @@ class App:
             self.queue_tree.selection_remove(*selection)
 
     def _on_queue_drag_start(self, event):
+        """Remember which queue row a drag-to-reorder started on."""
         row = self.queue_tree.identify_row(event.y)
         self._queue_drag_index = int(row) if row else None
 
     def _on_queue_drag_motion(self, event):
+        """While dragging in the queue, move the dragged track to the row under
+        the pointer (live reordering)."""
         if self._queue_drag_index is None:
             return
         row = self.queue_tree.identify_row(event.y)
@@ -995,6 +2124,8 @@ class App:
         self._refresh_playlist_view()
 
     def _show_playlist_column_menu(self, event):
+        """Right-click on the playlist table header: a checkbox menu for which
+        columns (Artist, Title, Album, Genre, Year, ...) are shown."""
         menu = tk.Menu(self.root, tearoff=0, **self._menu_colors())
         for key, label in PLAYLIST_COLUMNS:
             var = tk.BooleanVar(
@@ -1005,6 +2136,8 @@ class App:
         self._popup_menu(menu, event)
 
     def _toggle_playlist_column(self, key, var):
+        """Show/hide one playlist column from the header menu, never allowing
+        the last visible column to be hidden."""
         new_value = var.get()
         if not new_value:
             currently_visible = [
@@ -1019,6 +2152,9 @@ class App:
 
     # -- playlist background photo (Artist/Title/Album/Duration table) ---
     def _choose_playlist_background(self):
+        """Set Background... button: pick an image to show faded behind the
+        playlist table (and recolor the player from it if "Match Player
+        Colors to Background Image" is on)."""
         path = filedialog.askopenfilename(
             title="Choose a background image", filetypes=IMAGE_FILETYPES)
         if not path:
@@ -1030,22 +2166,39 @@ class App:
             return
         self.playlist_bg_source_image = image
         self.playlist_bg_path = path
-        self._apply_playlist_background()
+        self._image_palette = None
+        if self.match_bg_colors_var.get():
+            # Recolor the player from the new image (this also redraws
+            # the background photo against the new colors).
+            self._apply_theme()
+        else:
+            self._apply_playlist_background()
         self.status_var.set(
             f"Set playlist background image: {os.path.basename(path)}")
 
     def _clear_playlist_background(self):
+        """Clear Background button: remove the playlist table's background
+        photo (and fall back to the theme's colors if they were image-matched)."""
         self.playlist_bg_source_image = None
         self.playlist_bg_path = None
+        self._image_palette = None
+        self._playlist_bg_rendered_key = None
         if self._playlist_bg_style_installed:
             self.playlist_tree.configure(style="Treeview")
+        if self.match_bg_colors_var.get():
+            self._apply_theme()  # fall back to the selected theme's colors
         self.status_var.set("Cleared playlist background image")
 
     def _on_playlist_tree_configure(self, _event):
+        """The playlist table was resized: re-fit the background photo to it."""
         if self.playlist_bg_source_image is not None:
             self._apply_playlist_background()
 
     def _apply_playlist_background(self):
+        """Draw the background photo behind the playlist table: cover-fit it to
+        the table's current size, fade it toward the table color, and install
+        it as the table's field element via a dedicated ttk style. Plain rows
+        get an empty background so the photo shows through them."""
         # Guard against measuring a stale/transitional size (e.g. right
         # after a batch of ttk.Style changes, before Tk has finished
         # recomputing geometry) -- that would bake the photo in at the
@@ -1057,6 +2210,15 @@ class App:
             return
         style = ttk.Style()
         base_color = style.lookup("Treeview", "fieldbackground") or "white"
+        # Skip re-rendering when nothing changed (e.g. the <Configure>
+        # fired by switching the tree's style below) -- otherwise every
+        # such event would build yet another image element.
+        render_key = (id(self.playlist_bg_source_image), width, height,
+                      base_color)
+        if (render_key == getattr(self, "_playlist_bg_rendered_key", None)
+                and str(self.playlist_tree.cget("style")) == "Playlist.Treeview"):
+            return
+        self._playlist_bg_rendered_key = render_key
         base_rgb = self._rgb_of(base_color)
         # "Cover" fit: scale the image up to fill the entire table with no
         # gaps, cropping any excess from the center.
@@ -1086,11 +2248,19 @@ class App:
                 ]}),
             ]}),
         ])
+        # Every row paints its own solid "background" color on top of the
+        # field element, which hid the photo everywhere except the empty
+        # space below the last track. An empty row background makes plain
+        # rows transparent so the photo shows through; tagged rows (now
+        # playing / queued / ignored) and the selection keep their colors.
+        style.configure("Playlist.Treeview", background="")
         self.playlist_tree.configure(style="Playlist.Treeview")
         self._playlist_bg_style_installed = True
 
     # -- status bar -----------------------------------------------------
     def _build_status_bar(self):
+        """The status bar at the very bottom: one line of feedback text that
+        fades out a couple of seconds after each message."""
         self.status_var = tk.StringVar(value="Ready")
         self.status_bar_label = ttk.Label(
             self.root, textvariable=self.status_var, anchor=tk.W,
@@ -1102,6 +2272,8 @@ class App:
         self.status_var.trace_add("write", self._on_status_changed)
 
     def _on_status_changed(self, *_args):
+        """Every new status message: show it in full color, then fade it into
+        the background after 2.5 seconds."""
         self._animate_color_fade(
             self.status_bar_label,
             lambda color: self.status_bar_label.configure(foreground=color),
@@ -1110,10 +2282,13 @@ class App:
 
     # -- file/folder actions ---------------------------------------------
     def open_files(self):
+        """File > Open File(s)...: add music files to the playlist; any .zip
+        album archives picked are imported (see import_album_archive)."""
         paths = filedialog.askopenfilenames(
             title="Select music file(s) or album archive(s)", filetypes=MUSIC_FILETYPES)
         added = 0
         for path in paths:
+            path = os.path.normpath(path)
             if looks_like_archive(path):
                 self.import_album_archive(path)
             else:
@@ -1122,7 +2297,15 @@ class App:
         if added:
             self.status_var.set(f"Added {added} file(s)")
 
+    def _on_toggle_delete_zip(self):
+        """Settings > "Delete Zip After Import" toggled: confirm the new mode."""
+        self.status_var.set(
+            "Zip archives will be deleted after import"
+            if self.delete_zip_after_import_var.get()
+            else "Zip archives will be kept after import")
+
     def open_archive(self):
+        """File > Import Album Archive (.zip)...: import one or more archives."""
         paths = filedialog.askopenfilenames(
             title="Select album archive(s)",
             filetypes=[("Zip archives", "*.zip"), ("All files", "*.*")],
@@ -1131,9 +2314,15 @@ class App:
             self.import_album_archive(path)
 
     def open_folder(self):
+        """File > Open Folder... / Library > Add Folder: add a folder (and all
+        its subfolders/music files) to the library tree and playlist."""
         path = filedialog.askdirectory(title="Select folder")
         if not path:
             return
+        # The file dialogs return forward-slash paths while os.scandir /
+        # os.path.join produce backslashes on Windows; normalize so every
+        # library node id uses one consistent form (see _add_library_folder).
+        path = os.path.normpath(path)
         self.player.library_roots.append(path)
         root_id = self.library_tree.insert(
             "", tk.END, iid=path, text=os.path.basename(path) or path, open=True)
@@ -1173,6 +2362,7 @@ class App:
         '<source folder>/<Artist>/<Year> - <Album>/', merging into any
         existing artist folder that already exists at that location.
         """
+        zip_path = os.path.normpath(zip_path)
         if not zipfile.is_zipfile(zip_path):
             self.status_var.set(
                 f"'{os.path.basename(zip_path)}' is not a valid (or fully downloaded) zip archive")
@@ -1221,12 +2411,22 @@ class App:
                 moved += 1
 
             self._add_library_folder(artist_dir)
-            self.status_var.set(
-                f"Imported {moved} track(s) into {os.path.relpath(album_dir, dest_root)}")
+            message = (f"Imported {moved} track(s) into "
+                       f"{os.path.relpath(album_dir, dest_root)}")
+            if moved and self.delete_zip_after_import_var.get():
+                try:
+                    os.remove(zip_path)
+                    message += f" (deleted {os.path.basename(zip_path)})"
+                except OSError as exc:
+                    message += f" (could not delete zip: {exc})"
+            self.status_var.set(message)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _detect_album_info(self, audio_files, filename_artist, filename_album):
+        """Work out (artist, album, year) for an imported archive: the most
+        common values in the tracks' tags, falling back to what was parsed
+        from the zip's file name."""
         artists, albums, years = Counter(), Counter(), Counter()
         for path in audio_files:
             tags = read_common_tags(path)
@@ -1246,6 +2446,8 @@ class App:
         return artist, album, year
 
     def _unique_destination(self, dest_path):
+        """`dest_path` if it's free, else the same name with " (1)", " (2)", ...
+        added before the extension."""
         if not os.path.exists(dest_path):
             return dest_path
         root, ext = os.path.splitext(dest_path)
@@ -1257,25 +2459,79 @@ class App:
         return candidate
 
     def _add_library_folder(self, dirpath):
-        """Add or refresh `dirpath` as a top-level node in the library tree
-        and merge any newly found tracks into the playlist."""
-        is_new = dirpath not in self.player.library_roots
+        """Add or refresh `dirpath` in the library tree and merge any newly
+        found tracks into the playlist. If it lives inside a folder that's
+        already in the library (e.g. an archive extracted next to a zip
+        sitting in a library folder), it's shown nested in place under
+        that folder rather than as a separate top-level entry."""
+        # Normalize separators: node ids come from os.scandir (backslashes
+        # on Windows), while file dialogs hand back forward slashes. A
+        # mixed path like "C:/music/albums\\Artist" never matched its
+        # real node, so it was added again as a stray top-level folder.
+        dirpath = os.path.normpath(dirpath)
+        covered = self._library_root_containing(dirpath) is not None
+
         if self.library_tree.exists(dirpath):
             # Already present in the tree (either as a previously-added
             # root, or as a folder discovered while populating another
             # root it happens to be nested inside) -- just refresh its
             # contents instead of trying to insert a duplicate node.
             self.library_tree.delete(*self.library_tree.get_children(dirpath))
+            self._populate_library_node(dirpath, dirpath)
         else:
-            self.library_tree.insert(
-                "", tk.END, iid=dirpath, text=os.path.basename(dirpath) or dirpath, open=True)
+            ancestor = self._nearest_library_ancestor(dirpath)
+            if ancestor is not None and ancestor == os.path.dirname(dirpath):
+                self.library_tree.insert(
+                    ancestor, self._library_insert_index(ancestor, dirpath),
+                    iid=dirpath, text=os.path.basename(dirpath), open=False)
+                self._populate_library_node(dirpath, dirpath)
+            elif ancestor is not None:
+                # Intermediate folders are new too: just rescan the
+                # nearest folder we already show.
+                self.library_tree.delete(
+                    *self.library_tree.get_children(ancestor))
+                self._populate_library_node(ancestor, ancestor)
+            else:
+                self.library_tree.insert(
+                    "", tk.END, iid=dirpath,
+                    text=os.path.basename(dirpath) or dirpath, open=True)
+                self._populate_library_node(dirpath, dirpath)
 
-        if is_new:
+        if not covered and dirpath not in self.player.library_roots:
             self.player.library_roots.append(dirpath)
 
-        self._populate_library_node(dirpath, dirpath)
+    def _library_root_containing(self, dirpath):
+        """The library root folder that `dirpath` is strictly inside of,
+        or None."""
+        for root_dir in self.player.library_roots:
+            root_dir = os.path.normpath(root_dir)
+            if dirpath != root_dir and dirpath.lower().startswith(
+                    root_dir.rstrip(os.sep).lower() + os.sep):
+                return root_dir
+        return None
+
+    def _nearest_library_ancestor(self, dirpath):
+        """The closest parent folder of `dirpath` that already has a node
+        in the library tree, or None."""
+        current = os.path.dirname(dirpath)
+        while current and current != os.path.dirname(current):
+            if self.library_tree.exists(current):
+                return current
+            current = os.path.dirname(current)
+        return None
+
+    def _library_insert_index(self, parent_id, dirpath):
+        """Index at which to insert folder `dirpath` under `parent_id` so it
+        keeps _populate_library_node's order (folders first, A-Z)."""
+        name = os.path.basename(dirpath).lower()
+        for index, child in enumerate(self.library_tree.get_children(parent_id)):
+            if not os.path.isdir(child) or os.path.basename(child).lower() > name:
+                return index
+        return tk.END
 
     def _add_track(self, path):
+        """Add one music file to the playlist (no-op if it's already there):
+        read its tags and insert its row if it passes the current filter."""
         if path in self.player.playlist:
             return
         self.player.playlist.append(path)
@@ -1310,6 +2566,9 @@ class App:
         }
 
     def _row_values(self, path):
+        """The playlist table cell values for `path`, in the order of the
+        currently visible columns (ignored tracks get a cross before the
+        title)."""
         tags = self.track_tags.get(path, {})
         values = []
         for key in self.playlist_tree["columns"]:
@@ -1335,6 +2594,8 @@ class App:
         return tuple(tags)
 
     def _track_passes_filter(self, path):
+        """True if `path` should be listed in the playlist table: it matches the
+        search text and the active album/artist/folder filter, if any."""
         if not self._matches_search(path):
             return False
         if self.current_filter is None:
@@ -1346,6 +2607,8 @@ class App:
         return tags.get(kind, "").strip().lower() == value.strip().lower()
 
     def _refresh_playlist_view(self):
+        """Rebuild the playlist table from scratch: every track that passes the
+        filter, in the current sort order, with its highlight tags."""
         self.playlist_tree.delete(*self.playlist_tree.get_children())
         paths = [
             p for p in self.player.playlist if self._track_passes_filter(p)]
@@ -1355,6 +2618,7 @@ class App:
                 tags=self._row_tags(path))
 
     def _current_playing_path(self):
+        """Path of the current track, or None."""
         index = self.player.current_index
         if index is not None and 0 <= index < len(self.player.playlist):
             return self.player.playlist[index]
@@ -1434,6 +2698,7 @@ class App:
 
     @staticmethod
     def _sort_value_text(value):
+        """Normalize a text cell for sorting (trimmed, lowercase, None -> "")."""
         return (value or "").strip().lower()
 
     @staticmethod
@@ -1465,12 +2730,16 @@ class App:
         return seconds
 
     def show_full_playlist(self):
+        """Edit > Show Full Playlist: drop the album/artist/folder filter."""
         self.current_filter = None
         self._refresh_playlist_view()
         self._clear_library_highlight()
         self.status_var.set("Showing full playlist")
 
     def _filter_by(self, kind, path):
+        """Show only tracks whose `kind` tag ("album" or "artist") equals that
+        of track `path` (Go to Album / More by Same Artist), and highlight the
+        library folders they're in."""
         value = self.track_tags.get(path, {}).get(kind, "")
         if not value:
             self.status_var.set(f"No {kind} tag found for this track")
@@ -1483,6 +2752,7 @@ class App:
         self.status_var.set(f"Filtered by {kind}: {value}")
 
     def _clear_library_highlight(self):
+        """Remove the filter-match highlight from library folders."""
         for item in self._library_highlighted_items:
             if self.library_tree.exists(item):
                 self.library_tree.item(item, tags=())
@@ -1526,10 +2796,15 @@ class App:
             self.library_tree.see(folders[0])
 
     def remove_selected(self):
+        """Edit > Remove Selected: remove the selected tracks from the playlist
+        (and from the library tree; the files on disk are untouched)."""
         for path in self.playlist_tree.selection():
             self._remove_track(path)
 
     def _remove_track(self, path, remove_from_library=True):
+        """Remove one track from the playlist table, the player's lists (queue,
+        ignored set) and its cached tags -- and from the library tree too unless
+        `remove_from_library` is False. Never deletes the file itself."""
         if self.playlist_tree.exists(path):
             self.playlist_tree.delete(path)
         if remove_from_library and self.library_tree.exists(path):
@@ -1543,6 +2818,7 @@ class App:
         self._refresh_queue_view()
 
     def clear_playlist(self):
+        """Edit > Clear Playlist: empty the playlist and queue."""
         # Only empties the playlist table/queue -- the library tree (your
         # imported folders) is left untouched, so tracks are still there
         # to re-add (e.g. via double-click) without re-importing folders.
@@ -1582,6 +2858,8 @@ class App:
         return paths
 
     def _on_tree_double_click(self, event):
+        """Double-click in the playlist table or library tree: play that track,
+        or every track inside a double-clicked folder/playlist."""
         tree = event.widget
         if (tree is self.playlist_tree
                 and tree.identify_region(event.x, event.y) == "heading"):
@@ -1632,6 +2910,8 @@ class App:
         self._sort_playlist_by(columns[index])
 
     def _sort_playlist_by(self, key):
+        """Sort the playlist table by column `key`; clicking the same column
+        again flips between ascending and descending."""
         if self.playlist_sort_key == key:
             self.playlist_sort_reverse = not self.playlist_sort_reverse
         else:
@@ -1643,6 +2923,9 @@ class App:
         self.status_var.set(f"Sorted by {label} ({direction})")
 
     def _on_tree_right_click(self, event):
+        """Right-click in the playlist table or library tree: the column menu on
+        the header, otherwise the context menu for the clicked row (which is
+        selected first if it wasn't already)."""
         tree = event.widget
         if tree is self.playlist_tree and tree.identify_region(event.x, event.y) == "heading":
             self._show_playlist_column_menu(event)
@@ -1682,6 +2965,9 @@ class App:
         self._play_track(paths[0])
 
     def _show_context_menu(self, event, tree, item):
+        """Context menu for the playlist table / a playlist's tracks: actions
+        apply to the clicked row, or to the whole selection where it makes
+        sense."""
         primary_paths = self._collect_audio_paths(tree, item)
 
         selected_paths = []
@@ -2029,6 +3315,7 @@ class App:
         button_row.pack(side=tk.BOTTOM, fill=tk.X)
 
         def on_ok():
+            """OK: apply the chosen parent playlist (first entry = no parent)."""
             selection = listbox.curselection()
             if not selection:
                 dialog.destroy()
@@ -2062,6 +3349,7 @@ class App:
                 f"Cleared mother playlist for '{info['name']}'")
 
     def remove_track_from_playlist(self, cue_path, item_id):
+        """Remove one track from a cue playlist and save the playlist file."""
         info = self.playlists.get(cue_path)
         track_info = self._playlist_track_info.get(item_id)
         if info is None or track_info is None:
@@ -2076,6 +3364,7 @@ class App:
         self.status_var.set(f"Removed track from playlist '{info['name']}'")
 
     def rename_playlist(self, cue_path):
+        """Ask for a new name for a cue playlist and save it."""
         info = self.playlists.get(cue_path)
         if info is None:
             return
@@ -2218,6 +3507,7 @@ class App:
         return submenu
 
     def _popup_menu(self, menu, event):
+        """Show a right-click menu at the pointer, closing it on outside click."""
         # Ensure the menu closes if the user clicks anywhere outside it.
         menu.bind("<FocusOut>", lambda _e: menu.unpost())
         try:
@@ -2228,6 +3518,9 @@ class App:
 
     # -- drag-and-drop tracks onto a playlist -----------------------------
     def _on_drag_start(self, event):
+        """Mouse down in the playlist table / library tree: begin a possible
+        drag of the clicked row (or of the whole selection if one of several
+        selected rows was pressed) toward a playlist in the library tree."""
         tree = event.widget
         if tree.identify_region(event.x, event.y) == "heading":
             return
@@ -2252,6 +3545,8 @@ class App:
         return None
 
     def _begin_drag(self, tree, rows):
+        """Collect the tracks behind the dragged rows and show the floating
+        "N tracks" indicator next to the pointer."""
         paths = []
         for row in rows:
             for path in self._collect_audio_paths(tree, row):
@@ -2263,11 +3558,14 @@ class App:
         self._drag_indicator = self._make_drag_indicator(len(paths))
 
     def _on_drag_motion(self, event):
+        """Keep the drag indicator following the pointer."""
         if not self._drag_paths:
             return
         self._move_drag_indicator(event)
 
     def _on_drag_release(self, event):
+        """Drop: if released on a playlist node in the library tree, add the
+        dragged tracks to that playlist."""
         paths = self._drag_paths
         self._drag_paths = None
         self._destroy_drag_indicator()
@@ -2302,7 +3600,8 @@ class App:
                 pass
             noun = "track" if count == 1 else "tracks"
             tk.Label(
-                top, text=f"{count} {noun}", padx=6, pady=2, font=("", 9),
+                top, text=f"{count} {noun}", padx=6, pady=2,
+                font=resolve_font(FONTS["base"], self.palette),
                 bg=self.palette["highlight_bg"], fg=self.palette["highlight_fg"],
             ).pack()
             self._fade_toplevel_alpha(top, 0.0, 0.92)
@@ -2317,6 +3616,7 @@ class App:
         transient popups like the drag indicator. Silently no-ops if the
         window (or the platform) doesn't support `-alpha`."""
         def step(i=0):
+            """One step of the window opacity fade."""
             if not window.winfo_exists():
                 if on_complete:
                     on_complete()
@@ -2338,6 +3638,7 @@ class App:
         step(0)
 
     def _move_drag_indicator(self, event):
+        """Place the drag indicator just below-right of the pointer."""
         if self._drag_indicator is not None:
             try:
                 self._drag_indicator.geometry(
@@ -2346,6 +3647,7 @@ class App:
                 pass
 
     def _destroy_drag_indicator(self):
+        """Fade out and remove the drag indicator window."""
         if self._drag_indicator is not None:
             window = self._drag_indicator
             self._drag_indicator = None
@@ -2355,6 +3657,7 @@ class App:
 
     @staticmethod
     def _safe_destroy(window):
+        """Destroy a window, ignoring the error if it's already gone."""
         try:
             window.destroy()
         except tk.TclError:
@@ -2373,9 +3676,12 @@ class App:
         self._animate_seek_bar(ratio * self.current_duration)
 
     def _animate_seek_bar(self, target_seconds, total_steps=6, step_ms=20):
+        """Glide the progress bar to `target_seconds` over a few quick steps,
+        then actually seek the audio there."""
         start_value = self.now_playing_progress["value"] or 0.0
 
         def step(i=0):
+            """Move the bar one step closer; seek on the last step."""
             ratio = (i + 1) / total_steps
             self._set_progress(
                 start_value + (target_seconds - start_value) * ratio)
@@ -2396,16 +3702,17 @@ class App:
         self._popup_menu(menu, event)
 
     def _seek_to(self, seconds):
+        """Jump playback to `seconds` (clamped to the track), keeping the
+        paused/playing state."""
         seconds = max(0.0, min(seconds, self.current_duration))
+        self._update_lyrics_position(seconds)
         self.elapsed_before_pause = seconds
         self.play_started_monotonic = time.monotonic()
         self._set_progress(seconds)
 
         if self.audio_ready:
             try:
-                pygame.mixer.music.play(start=seconds)
-                if self.is_paused:
-                    pygame.mixer.music.pause()
+                self.audio.seek(seconds)
             except Exception as exc:
                 self.status_var.set(f"Seek not supported for this file: {exc}")
 
@@ -2414,6 +3721,8 @@ class App:
             self._tick_progress()
 
     def context_shuffle_play(self):
+        """Context menu "Shuffle Play": play a random non-ignored track from the
+        current scope."""
         scope = self._current_scope_paths()
         candidates = [
             p for p in scope if p not in self.player.ignored] or scope
@@ -2468,6 +3777,7 @@ class App:
         self.context_add_to_queue([path])
 
     def context_remove_from_playlist(self, paths):
+        """Context menu "Remove from Playlist" for the given tracks."""
         for path in paths:
             self._remove_track(path)
         self.status_var.set(f"Removed {len(paths)} track(s) from playlist")
@@ -2502,6 +3812,8 @@ class App:
             self._apply_library_ignored_mark(path)
 
     def _apply_library_ignored_mark(self, path):
+        """Show a track's ignored state in the library tree (cross prefix and
+        grayed-out "ignored" tag)."""
         if not self.library_tree.exists(path):
             return
         ignored = path in self.player.ignored
@@ -2554,6 +3866,8 @@ class App:
         return proposed == "" or proposed.isdigit()
 
     def _make_tag_entry(self, parent, key, var, width):
+        """A tag entry box for the Properties dialogs; numeric fields (track #,
+        disc #, year, BPM) only accept digits."""
         if key in NUMERIC_TAG_FIELDS:
             return ttk.Entry(
                 parent, textvariable=var, width=width,
@@ -2561,6 +3875,8 @@ class App:
         return ttk.Entry(parent, textvariable=var, width=width)
 
     def show_properties(self, path=None):
+        """Properties dialog for one track: editable common tags, Save/Cancel,
+        and a read-only Details list of the file's full metadata."""
         if path is None:
             selection = self.playlist_tree.selection()
             if not selection:
@@ -2616,6 +3932,7 @@ class App:
             tree.insert("", tk.END, values=(field, value))
 
         def on_save():
+            """Write the edited tags to the file (blank fields remove the tag)."""
             updates = {key: var.get() for key, var in entries.items()}
             try:
                 apply_common_tags(path, updates, clear_blank=True)
@@ -2632,6 +3949,8 @@ class App:
                    command=dialog.destroy).pack(side=tk.RIGHT)
 
     def open_properties(self, paths=None):
+        """Edit > Properties...: single-track dialog for one track, bulk-edit
+        dialog for several."""
         if paths is None:
             paths = self.playlist_tree.selection()
         if not paths:
@@ -2643,6 +3962,9 @@ class App:
             self.show_properties(paths[0])
 
     def open_bulk_properties(self, paths=None):
+        """Bulk Edit dialog: edit common tags of several tracks at once. Fields
+        whose value differs between tracks show a "mixed" placeholder and are
+        left unchanged unless edited."""
         if paths is None:
             paths = self.playlist_tree.selection()
         if not paths:
@@ -2683,6 +4005,7 @@ class App:
         button_row.pack(side=tk.BOTTOM, fill=tk.X)
 
         def on_save():
+            """Write every edited (non-blank, non-"mixed") field to all tracks."""
             updates = {
                 key: var.get() for key, var in entries.items()
                 if var.get().strip() and var.get() != MIXED_SENTINEL
@@ -2726,6 +4049,8 @@ class App:
         return MIXED_SENTINEL
 
     def _update_track_cache(self, path):
+        """Re-read `path`'s tags after an edit and refresh its playlist row and,
+        if it's playing, the Now Playing title/artist."""
         self.track_tags[path] = self._read_all_track_tags(path)
         if self.playlist_tree.exists(path):
             self.playlist_tree.item(path, values=self._row_values(path))
@@ -2740,9 +4065,10 @@ class App:
 
     # -- playback ----------------------------------------------------------
     def on_volume_change(self, value):
+        """Volume slider moved: set the mixer volume (0-100 -> 0.0-1.0)."""
         if self.audio_ready:
             try:
-                pygame.mixer.music.set_volume(float(value) / 100)
+                self.audio.set_volume(float(value) / 100)
             except Exception:
                 pass
 
@@ -2782,14 +4108,15 @@ class App:
 
         if self.audio_ready:
             try:
-                pygame.mixer.music.load(path)
-                pygame.mixer.music.set_volume(self.volume_var.get() / 100)
-                pygame.mixer.music.play()
+                self.audio.load(path)
+                self.audio.set_volume(self.volume_var.get() / 100)
+                self.audio.play()
             except Exception as exc:
                 self.status_var.set(f"Playback error: {exc}")
 
         artist, title, _album, _dur = read_track_tags(path)
         self.current_duration = get_track_duration(path)
+        self._load_lyrics(path)
 
         new_art_pil = get_track_art_pil(path) or make_placeholder_art_pil()
         self._crossfade_art(new_art_pil)
@@ -2817,6 +4144,7 @@ class App:
         self._tick_progress()
 
     def _now_playing_text_widgets(self):
+        """The Now Playing title and artist labels (animated together)."""
         return (self.now_title_label, self.now_artist_label)
 
     # Supersampling factor for the disk rendering: everything (circle
@@ -2845,6 +4173,9 @@ class App:
         page_bg_color = self.palette["bg"]
 
         art = art_pil.resize((hi, hi), Image.LANCZOS)
+        if not self.spinning_disc_var.get():
+            # Spinning disc turned off in Settings: just the plain cover.
+            return art.convert("RGB"), diameter
         disk = Image.new("RGB", (hi, hi), color=page_bg_color)
         mask = Image.new("L", (hi, hi), 0)
         ImageDraw.Draw(mask).ellipse((0, 0, hi - 1, hi - 1), fill=255)
@@ -2885,25 +4216,15 @@ class App:
         return disk, diameter
 
     def _disk_frame_from_hires(self, hires_image, diameter, angle=0):
-        """Rotate the supersampled `hires_image` by `angle` degrees (if
-        any) and downsample it to `diameter` for a single smooth,
-        anti-aliased on-screen disk frame.
-
-        A slight Gaussian blur is applied BEFORE the downsample: LANCZOS
-        (needed for a crisp result) rings/overshoots on very
-        high-contrast edges -- like the bright white rim against a dark
-        theme's near-black background -- which shows up as a faint dark
-        "outline" just outside the rim. Pre-blurring band-limits that
-        edge just enough to remove the ringing while still downsampling
-        to a crisp, clean circle (the blur radius is tiny relative to
-        the supersampled size, so it doesn't noticeably soften the art
-        or rim itself)."""
-        if angle:
-            hires_image = hires_image.rotate(
-                -angle, resample=Image.BICUBIC, fillcolor=self.palette["bg"])
-        blurred = hires_image.filter(
-            ImageFilter.GaussianBlur(radius=self._DISK_SUPERSAMPLE / 2))
-        return blurred.resize((diameter, diameter), Image.LANCZOS)
+        """Render one on-screen disc frame at `angle` degrees with the
+        current theme/settings (see render_disk_frame for how)."""
+        # Read the Tk-side settings here, on the main thread, and hand
+        # plain values to the pure render function (which is also what the
+        # background pre-render thread calls -- Tk objects such as the
+        # BooleanVar must never be touched from another thread).
+        return render_disk_frame(
+            hires_image, diameter, angle, self.palette["bg"],
+            self.spinning_disc_var.get(), self._DISK_SUPERSAMPLE)
 
     def _make_disk_image(self, art_pil, angle=0):
         """One-off disk render (e.g. a single crossfade blend frame):
@@ -2923,30 +4244,111 @@ class App:
         hires, diameter = self._build_disk_hires(art_pil)
         self._disk_hires_image = hires
         self._disk_base_image = self._disk_frame_from_hires(hires, diameter)
+        # Rendered spin frames, keyed by angle. The disc turns in fixed
+        # _DISK_STEP-degree steps, so there are only 360 / 3 = 120 distinct
+        # frames; once a frame exists it's simply re-shown on every later
+        # turn. Invalidated here whenever the art or theme changes.
+        self._disk_frame_cache = {}
+        self._start_disk_prerender(hires, diameter)
+
+    # Degrees the disc turns per animation frame (every 25 ms).
+    _DISK_STEP = 3
+
+    def _start_disk_prerender(self, hires, diameter):
+        """Render every spin frame of the current disc on a background
+        thread, right when the art is set, so the expensive work (rotate +
+        blur + downsample, ~6 ms per frame) is done before -- not during --
+        playback and never stalls the UI.
+
+        The worker only produces PIL images (Tk is single-threaded, so it
+        can't create PhotoImages); _spin_disk_step turns each one into a
+        PhotoImage on first use, which is cheap. Every call bumps a
+        generation counter: a worker whose art was replaced in the meantime
+        (track change, theme switch) sees the new number and stops, and
+        its results land in its own, now-orphaned dict."""
+        self._disk_render_generation = getattr(
+            self, "_disk_render_generation", 0) + 1
+        generation = self._disk_render_generation
+        frames = {}
+        self._disk_prerendered = frames
+        if not self.spinning_disc_var.get():
+            return  # plain cover art: nothing spins, nothing to render
+        fill_color = self.palette["bg"]
+        start = getattr(self, "_disk_angle", 0)
+        # Render in playback order starting just after the current angle,
+        # so the frames needed first are ready first.
+        angles = [(start + self._DISK_STEP * i) % 360
+                  for i in range(1, 360 // self._DISK_STEP + 1)]
+
+        def work():
+            """Background thread body: render each angle in order, quitting as
+            soon as newer art has replaced this disc."""
+            for angle in angles:
+                if self._disk_render_generation != generation:
+                    return  # superseded by newer art -- stop early
+                frames[angle] = render_disk_frame(
+                    hires, diameter, angle, fill_color, True,
+                    self._DISK_SUPERSAMPLE)
+
+        threading.Thread(target=work, name="disc-prerender", daemon=True).start()
 
     def _start_disk_spin(self):
         """Begin (or resume) continuously rotating the Now Playing disk.
         A no-op if it's already spinning."""
-        if self._disk_spin_job is not None or self._disk_hires_image is None:
+        if (self._disk_spin_job is not None or self._disk_hires_image is None
+                or not self.spinning_disc_var.get()):
             return
         self._spin_disk_step()
 
     def _spin_disk_step(self):
-        if not (self.is_playing and not self.is_paused) or self._disk_hires_image is None:
+        """One animation frame of the spinning disc: advance the angle and show
+        that angle's frame (cached PhotoImage, else the background thread's
+        pre-rendered image, else render it now), then schedule the next frame
+        in 25 ms. Stops on its own when playback isn't running."""
+        if (not (self.is_playing and not self.is_paused)
+                or self._disk_hires_image is None
+                or not self.spinning_disc_var.get()):
             self._disk_spin_job = None
             return
         # A small angle step at a high frame rate (rather than a big jump
         # every 50ms) is what makes the rotation read as smooth motion
         # instead of a visible stutter; the supersampled hi-res source
         # keeps each rotated frame's edge anti-aliased too.
-        self._disk_angle = (self._disk_angle + 3) % 360
-        diameter = self._disk_base_image.size[0]
-        rotated = self._disk_frame_from_hires(
-            self._disk_hires_image, diameter, self._disk_angle)
-        photo = ImageTk.PhotoImage(rotated)
+        self._disk_angle = (self._disk_angle + self._DISK_STEP) % 360
+        cache = getattr(self, "_disk_frame_cache", None)
+        if cache is None:
+            cache = self._disk_frame_cache = {}
+        photo = cache.get(self._disk_angle)
+        if photo is None:
+            # Prefer the background thread's pre-rendered image (popped:
+            # once converted, the PhotoImage cache holds it); only render
+            # here if the worker hasn't reached this angle yet.
+            rotated = getattr(self, "_disk_prerendered", {}).pop(
+                self._disk_angle, None)
+            if rotated is None:
+                diameter = self._disk_base_image.size[0]
+                rotated = self._disk_frame_from_hires(
+                    self._disk_hires_image, diameter, self._disk_angle)
+            photo = cache[self._disk_angle] = ImageTk.PhotoImage(rotated)
         self.now_playing_art_image = photo
         self.art_label.config(image=photo)
         self._disk_spin_job = self.root.after(25, self._spin_disk_step)
+
+    def _on_toggle_spinning_disc(self):
+        """Settings > "Spinning Disc" toggled: redraw the current art in the
+        new style (disc or plain cover) and resume spinning if it's on and
+        a track is playing."""
+        enabled = self.spinning_disc_var.get()
+        self._reset_disk_spin()
+        if getattr(self, "_current_art_pil", None) is not None:
+            self._set_disk_base(self._current_art_pil)
+            photo = ImageTk.PhotoImage(self._disk_base_image)
+            self.now_playing_art_image = photo
+            self.art_label.config(image=photo)
+            if enabled and self.is_playing and not self.is_paused:
+                self._start_disk_spin()
+        self.status_var.set(
+            "Spinning disc: on" if enabled else "Spinning disc: off (cover art)")
 
     def _stop_disk_spin(self):
         """Freeze the disk at its current rotation (used when pausing/
@@ -2983,6 +4385,8 @@ class App:
             old_art_pil = new_art_pil
 
         def step(i=0):
+            """Show one blended frame; on the last, settle on the new art and
+            resume spinning if a track is playing."""
             ratio = (i + 1) / total_steps
             frame = Image.blend(old_art_pil, new_art_pil, ratio)
             disk_frame = self._make_disk_image(frame, angle=self._disk_angle)
@@ -3010,11 +4414,20 @@ class App:
             total_steps=10, step_ms=30)
 
     def _set_progress(self, elapsed):
+        """Show `elapsed` seconds on the progress bar, the elapsed-time label
+        and the toolbar seek slider (unless the user is dragging it)."""
         capped = max(0.0, min(elapsed, self.current_duration or elapsed))
         self.now_playing_progress["value"] = capped
+        if getattr(self, "_seek_dragging", False):
+            return  # don't fight the user's drag (or overwrite its preview)
         self.elapsed_var.set(format_duration(capped) or "0:00")
+        if hasattr(self, "seek_var"):
+            fraction = capped / self.current_duration if self.current_duration else 0.0
+            self.seek_var.set(fraction * self.SEEK_RESOLUTION)
 
     def _tick_progress(self):
+        """Progress timer (every 250 ms while a track is loaded): update the bar
+        from the wall clock, and move on to the next track when this one ends."""
         if self.is_playing and not self.is_paused:
             elapsed = self.elapsed_before_pause + \
                 (time.monotonic() - self.play_started_monotonic)
@@ -3023,22 +4436,26 @@ class App:
                 self.on_next()
                 return
             self._set_progress(elapsed)
+            self._update_lyrics_position(elapsed)
         if self.is_playing:
             self.progress_job = self.root.after(250, self._tick_progress)
 
     def on_play_pause_toggle(self):
+        """The Now Playing Play/Pause button: pause if playing, else play."""
         if self.is_playing and not self.is_paused:
             self.on_pause()
         else:
             self.on_play()
 
     def _update_play_pause_button(self):
+        """Label the Play/Pause button for the current state."""
         if self.is_playing and not self.is_paused:
             self.play_pause_button.config(text="Pause")
         else:
             self.play_pause_button.config(text="Play")
 
     def toggle_shuffle(self):
+        """Shuffle button: toggle random order for automatic next/previous."""
         self.shuffle_enabled = not self.shuffle_enabled
         self.shuffle_button.config(
             relief=tk.SUNKEN if self.shuffle_enabled else tk.RAISED)
@@ -3052,16 +4469,21 @@ class App:
                      self.shuffle_enabled, self.played_numbers)
 
     def toggle_repeat(self):
+        """Repeat button: when on, playback keeps going after every track in
+        the album/playlist has played (instead of stopping), with already
+        played tracks eligible again."""
         self.repeat_enabled = not self.repeat_enabled
         self.repeat_button.config(
             relief=tk.SUNKEN if self.repeat_enabled else tk.RAISED)
         self.status_var.set(f"Repeat {'On' if self.repeat_enabled else 'Off'}")
 
     def on_play(self):
+        """Play: resume if paused, otherwise start the selected track (or the
+        current/first track if nothing is selected)."""
         if self.is_playing and self.is_paused:
             if self.audio_ready:
                 try:
-                    pygame.mixer.music.unpause()
+                    self.audio.unpause()
                 except Exception:
                     pass
             self.play_started_monotonic = time.monotonic()
@@ -3084,11 +4506,12 @@ class App:
         self._play_track(path)
 
     def on_pause(self):
+        """Pause playback, remembering the position and freezing the disc."""
         if not self.is_playing or self.is_paused:
             return
         if self.audio_ready:
             try:
-                pygame.mixer.music.pause()
+                self.audio.pause()
             except Exception:
                 pass
         self.elapsed_before_pause += time.monotonic() - self.play_started_monotonic
@@ -3101,9 +4524,10 @@ class App:
         self._update_play_pause_button()
 
     def on_stop(self):
+        """Stop playback and reset the position and disc."""
         if self.audio_ready:
             try:
-                pygame.mixer.music.stop()
+                self.audio.stop()
             except Exception:
                 pass
         if self.progress_job is not None:
@@ -3119,6 +4543,7 @@ class App:
         self._update_play_pause_button()
 
     def on_previous(self):
+        """|<< : go back to the previously played track in this scope."""
         if not self.player.playlist:
             return
         path = self._pick_previous_path()
@@ -3131,6 +4556,8 @@ class App:
             self.status_var.set(f"Beginning of {self._scope_label()}")
 
     def on_next(self):
+        """>>| (and end of track): play the next queued track if any, otherwise
+        the next track in sequence/shuffle order; stop at the end of the scope."""
         if self.player.queue:
             path = self.player.queue.pop(0)
             self._refresh_queue_view()
@@ -3154,6 +4581,8 @@ class App:
             self.status_var.set(f"End of {self._scope_label()}")
 
     def _scope_label(self):
+        """What the current playback scope is called in messages ("playlist",
+        "album", "artist" or "folder")."""
         if self.current_filter is None:
             return "playlist"
         kind, _value = self.current_filter
@@ -3263,7 +4692,11 @@ class App:
         if not cache:
             return
 
-        for root_dir in sorted(cache.get("library_roots", []), key=len):
+        # Normalize paths saved by older versions, which could mix "/" and
+        # "\\" (that mismatch made archive-imported folders show up as
+        # separate top-level entries instead of nested in their folder).
+        roots = {os.path.normpath(p) for p in cache.get("library_roots", [])}
+        for root_dir in sorted(roots, key=len):
             if os.path.isdir(root_dir):
                 self._add_library_folder(root_dir)
 
@@ -3271,6 +4704,7 @@ class App:
         # saved separately; _add_track is a no-op for paths already added
         # by the library-folder scan above.
         for path in cache.get("playlist", []):
+            path = os.path.normpath(path)
             if os.path.isfile(path):
                 self._add_track(path)
 
@@ -3278,28 +4712,23 @@ class App:
             if os.path.isfile(cue_path):
                 self._load_playlist_from_cue(cue_path, is_restore=True)
 
-        right_bg_path = cache.get("right_box_bg_path")
-        if right_bg_path and os.path.isfile(right_bg_path):
-            try:
-                image = Image.open(right_bg_path)
-                self.right_box_bg_source_image = image
-                self.right_box_bg_path = right_bg_path
-                self._set_right_box_background(image)
-            except Exception:
-                pass
-
         playlist_bg_path = cache.get("playlist_bg_path")
         if playlist_bg_path and os.path.isfile(playlist_bg_path):
             try:
                 image = Image.open(playlist_bg_path)
                 self.playlist_bg_source_image = image
                 self.playlist_bg_path = playlist_bg_path
-                self._apply_playlist_background()
+                if self.match_bg_colors_var.get():
+                    self._apply_theme()
+                else:
+                    self._apply_playlist_background()
             except Exception:
                 pass
 
         now_playing = cache.get("now_playing") or {}
         path = now_playing.get("path")
+        if path:
+            path = os.path.normpath(path)
         if path and path in self.player.playlist:
             self._restore_now_playing_display(
                 path, now_playing.get("elapsed", 0.0))
@@ -3319,6 +4748,7 @@ class App:
         artist, title, _album, _dur = read_track_tags(path)
         self.current_duration = get_track_duration(path)
         elapsed = max(0.0, min(elapsed, self.current_duration or elapsed))
+        self._load_lyrics(path)
 
         self._current_art_pil = get_track_art_pil(
             path) or make_placeholder_art_pil()
@@ -3334,9 +4764,9 @@ class App:
 
         if self.audio_ready:
             try:
-                pygame.mixer.music.load(path)
-                pygame.mixer.music.play(start=elapsed)
-                pygame.mixer.music.pause()
+                self.audio.load(path)
+                self.audio.set_volume(self.volume_var.get() / 100)
+                self.audio.cue_paused(elapsed)
             except Exception:
                 pass
 
@@ -3364,7 +4794,18 @@ class App:
             "theme_name": self.theme_name,
             "library_roots": self._deduped_library_roots(),
             "playlist": list(self.player.playlist),
-            "right_box_bg_path": self.right_box_bg_path,
+            "match_bg_colors": bool(self.match_bg_colors_var.get()),
+            "spinning_disc": bool(self.spinning_disc_var.get()),
+            "delete_zip_after_import": bool(
+                self.delete_zip_after_import_var.get()),
+            "search_mode": self.search_mode,
+            "custom_theme": dict(THEMES[CUSTOM_THEME_NAME]),
+            "eq_enabled": self.eq_enabled,
+            "eq_gains": self.eq_gains,
+            "eq_preset": self.eq_preset,
+            "eq_custom_presets": self.eq_custom_presets,
+            "show_lyrics": bool(self.show_lyrics_var.get()),
+            "online_lyrics": bool(self.online_lyrics_var.get()),
             "playlist_bg_path": self.playlist_bg_path,
             "now_playing": now_playing,
             "playlist_columns": [
@@ -3379,7 +4820,8 @@ class App:
         (e.g. an album archive imported into a subfolder of an already-
         open library folder). Only keep the outermost folders so the
         cache doesn't store redundant/overlapping roots."""
-        roots = sorted(set(self.player.library_roots), key=len)
+        roots = sorted(
+            {os.path.normpath(p) for p in self.player.library_roots}, key=len)
         deduped = []
         for root_dir in roots:
             root_with_sep = root_dir.rstrip(os.sep) + os.sep
@@ -3389,6 +4831,7 @@ class App:
         return deduped
 
     def _on_close(self):
+        """Window closed: save the session, then exit."""
         self._save_cache()
         self.root.destroy()
 
@@ -3402,6 +4845,11 @@ class App:
             self.root.destroy()
         except tk.TclError:
             pass
+        if getattr(sys, "frozen", False):
+            # Packaged app (PyInstaller): sys.executable IS the app, and
+            # sys.argv[0] is its own path -- start a fresh copy of it.
+            subprocess.Popen([sys.executable] + sys.argv[1:])
+            sys.exit(0)
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def _pick_previous_path(self):
@@ -3428,3 +4876,437 @@ class App:
         logger.debug("_pick_previous_path: rewound to #%d %s (pos=%d)",
                      number, os.path.basename(path), self.history_pos)
         return path
+
+
+class ThemeEditor:
+    """The View > "Edit Custom Theme..." window: one row per palette key
+    (see styles.PALETTE_KEYS / PALETTE_DESCRIPTIONS) with a color swatch
+    (click to pick) and a hex box (type a #rrggbb value + Enter). Every
+    change is applied to the whole app immediately; the custom palette is
+    saved with the session."""
+
+    def __init__(self, app):
+        """Build the editor window: one row per palette color (swatch, hex
+        box, name, description), the font section, and the Start from /
+        Done row."""
+        self.app = app
+        window = tk.Toplevel(app.root)
+        window.title("Edit Custom Theme")
+        window.transient(app.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window = window
+
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body, text="Changes apply live. Editing a color switches to the "
+                       "Custom theme; the font applies to every theme.",
+            style="ToolbarLabel.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+
+        self.swatches = {}
+        self.hex_vars = {}
+        for row, key in enumerate(PALETTE_KEYS, start=1):
+            name, description = PALETTE_DESCRIPTIONS.get(key, (key, ""))
+            swatch = tk.Label(body, width=4, relief=tk.SOLID, bd=1,
+                              cursor="hand2")
+            swatch.grid(row=row, column=0, padx=(0, 8), pady=2, sticky="ns")
+            swatch.bind("<Button-1>", lambda _e, k=key: self.pick_color(k))
+            self.swatches[key] = swatch
+
+            hex_var = tk.StringVar()
+            entry = ttk.Entry(body, textvariable=hex_var, width=9)
+            entry.grid(row=row, column=1, padx=(0, 8), pady=2)
+            entry.bind("<Return>", lambda _e, k=key: self.commit_hex(k))
+            entry.bind("<FocusOut>", lambda _e, k=key: self.commit_hex(k))
+            self.hex_vars[key] = hex_var
+
+            ttk.Label(body, text=name, style="ToolbarLabel.TLabel").grid(
+                row=row, column=2, sticky="w", padx=(0, 10))
+            ttk.Label(body, text=f"{key}: {description}").grid(
+                row=row, column=3, sticky="w")
+
+        self._build_font_section(body, row=len(PALETTE_KEYS) + 1)
+
+        presets = ttk.Frame(body)
+        presets.grid(row=len(PALETTE_KEYS) + 2, column=0, columnspan=4,
+                     sticky="we", pady=(10, 0))
+        ttk.Label(presets, text="Start from:",
+                  style="ToolbarLabel.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        for theme_name in THEMES:
+            if theme_name == CUSTOM_THEME_NAME:
+                continue
+            ttk.Button(
+                presets, text=theme_name.replace("_", " ").title(),
+                style="PanelAction.TButton",
+                command=lambda t=theme_name: app.load_custom_theme_from(t)).pack(
+                side=tk.LEFT, padx=1)
+        ttk.Button(presets, text="Done", style="PanelAction.TButton",
+                   command=self.close).pack(side=tk.RIGHT)
+
+        self.apply_palette(app.palette)
+
+    def _build_font_section(self, body, row):
+        """Font family list (with filter box), size -/+ buttons, an
+        "Import Font..." button and a live preview."""
+        section = ttk.Frame(body)
+        section.grid(row=row, column=0, columnspan=4, sticky="we",
+                     pady=(12, 0))
+
+        left = ttk.Frame(section)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="Font", style="ToolbarLabel.TLabel").pack(
+            side=tk.TOP, anchor="w")
+        self.font_filter_var = tk.StringVar()
+        filter_entry = ttk.Entry(left, textvariable=self.font_filter_var, width=28)
+        filter_entry.pack(side=tk.TOP, fill=tk.X, pady=(2, 2))
+        self.font_filter_var.trace_add("write", lambda *_a: self._fill_font_list())
+        list_frame = ttk.Frame(left)
+        list_frame.pack(side=tk.TOP, fill=tk.BOTH)
+        self.font_list = tk.Listbox(list_frame, height=7, width=30,
+                                    exportselection=False, bd=1,
+                                    highlightthickness=0)
+        scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                               command=self.font_list.yview)
+        self.font_list.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.font_list.pack(side=tk.LEFT, fill=tk.BOTH)
+        self.font_list.bind("<<ListboxSelect>>", self._on_font_selected)
+
+        right = ttk.Frame(section)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
+        self.font_current_var = tk.StringVar()
+        ttk.Label(right, textvariable=self.font_current_var,
+                  style="ToolbarLabel.TLabel").pack(side=tk.TOP, anchor="w")
+
+        size_row = ttk.Frame(right)
+        size_row.pack(side=tk.TOP, anchor="w", pady=(6, 0))
+        ttk.Label(size_row, text="Size:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(size_row, text="A-", width=3, style="PanelAction.TButton",
+                   command=lambda: self._change_font_size(-1)).pack(side=tk.LEFT)
+        self.font_size_var = tk.StringVar()
+        ttk.Label(size_row, textvariable=self.font_size_var, width=5,
+                  anchor="center").pack(side=tk.LEFT)
+        ttk.Button(size_row, text="A+", width=3, style="PanelAction.TButton",
+                   command=lambda: self._change_font_size(1)).pack(side=tk.LEFT)
+
+        button_row = ttk.Frame(right)
+        button_row.pack(side=tk.TOP, anchor="w", pady=(6, 0))
+        ttk.Button(button_row, text="Import Font...", style="PanelAction.TButton",
+                   command=self._import_font).pack(side=tk.LEFT)
+        ttk.Button(button_row, text="Default Font", style="PanelAction.TButton",
+                   command=lambda: self.app.set_custom_theme_font(family="")).pack(
+            side=tk.LEFT, padx=(4, 0))
+
+        self.font_preview = tk.Label(
+            right, text="The quick brown fox jumps over the lazy dog\n"
+                        "ABCDEFG abcdefg 0123456789",
+            justify=tk.LEFT, anchor="w", padx=6, pady=6, relief=tk.SOLID, bd=1)
+        self.font_preview.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+
+        self._all_families = []
+        self._fill_font_list()
+
+    def _fill_font_list(self):
+        """Fill the font list with every installed (and imported) font family
+        that matches the filter box."""
+        families = sorted(
+            {f for f in tkfont.families(self.window) if not f.startswith("@")},
+            key=str.lower)
+        self._all_families = families
+        query = self.font_filter_var.get().strip().lower()
+        shown = [f for f in families if query in f.lower()]
+        self.font_list.delete(0, tk.END)
+        for family in shown:
+            self.font_list.insert(tk.END, family)
+        self._select_current_family()
+
+    def _select_current_family(self):
+        """Select and scroll to the font currently in use, if it's listed."""
+        current = THEMES[CUSTOM_THEME_NAME].get("font_family") or ""
+        self.font_list.selection_clear(0, tk.END)
+        if current:
+            items = self.font_list.get(0, tk.END)
+            if current in items:
+                index = items.index(current)
+                self.font_list.selection_set(index)
+                self.font_list.see(index)
+
+    def _on_font_selected(self, _event=None):
+        """A font was clicked in the list: apply it."""
+        selection = self.font_list.curselection()
+        if not selection:
+            return
+        family = self.font_list.get(selection[0])
+        if family != THEMES[CUSTOM_THEME_NAME].get("font_family"):
+            self.app.set_custom_theme_font(family=family)
+
+    def _change_font_size(self, delta):
+        """A- / A+ buttons: change the font size offset by `delta` points."""
+        offset = int(THEMES[CUSTOM_THEME_NAME].get("font_size_offset", 0) or 0)
+        self.app.set_custom_theme_font(size_offset=offset + delta)
+
+    def _import_font(self):
+        """Import Font... button: import a font file and switch to it."""
+        family = self.app.import_font_file(parent=self.window)
+        if family:
+            self.font_filter_var.set("")  # refreshes the list (new font)
+            self.app.set_custom_theme_font(family=family)
+
+    def _refresh_font_section(self, palette):
+        """Update the font section (current font, size, preview, list colors)
+        to match the current settings and theme."""
+        custom = THEMES[CUSTOM_THEME_NAME]
+        family = custom.get("font_family") or ""
+        offset = int(custom.get("font_size_offset", 0) or 0)
+        self.font_current_var.set(f"Current: {family or 'Default'}")
+        self.font_size_var.set(f"{offset:+d}")
+        self.font_list.configure(
+            bg=palette["field_bg"], fg=palette["field_fg"],
+            selectbackground=palette["select_bg"],
+            selectforeground=palette["select_fg"])
+        self.font_preview.configure(
+            font=resolve_font(FONTS["title"], custom),
+            bg=palette["field_bg"], fg=palette["field_fg"])
+        self._select_current_family()
+
+    def apply_palette(self, palette):
+        """Refresh the swatches/hex boxes (and this window's own colors)
+        from the app's current palette."""
+        custom = THEMES[CUSTOM_THEME_NAME]
+        if hasattr(self, "font_list"):
+            self._refresh_font_section(palette)
+        for key in PALETTE_KEYS:
+            color = custom[key]
+            self.swatches[key].configure(bg=color)
+            if self.hex_vars[key].get().lower() != color.lower():
+                self.hex_vars[key].set(color)
+        self.window.configure(bg=palette["bg"])
+        self.app._apply_title_bar_colors(palette, self.window)
+
+    def pick_color(self, key):
+        """Swatch clicked: open the color picker for palette color `key`."""
+        name = PALETTE_DESCRIPTIONS.get(key, (key, ""))[0]
+        _rgb, color = colorchooser.askcolor(
+            color=THEMES[CUSTOM_THEME_NAME][key], parent=self.window,
+            title=f"Pick color: {name}")
+        if color:
+            self.app.set_custom_theme_color(key, color.lower())
+
+    def commit_hex(self, key):
+        """Hex box committed (Enter / focus leaving): apply a valid color, or
+        put back the current one if the text isn't a #rrggbb color."""
+        value = self.hex_vars[key].get().strip()
+        if value and not value.startswith("#"):
+            value = "#" + value
+        if self.app._is_hex_color(value):
+            if value.lower() != THEMES[CUSTOM_THEME_NAME][key].lower():
+                self.app.set_custom_theme_color(key, value.lower())
+        else:
+            # Invalid input: put the current color back.
+            self.hex_vars[key].set(THEMES[CUSTOM_THEME_NAME][key])
+            self.app.status_var.set(
+                f"'{value}' isn't a color -- use the #rrggbb format")
+
+    def close(self):
+        """Close the editor window."""
+        self.app.theme_editor = None
+        self.window.destroy()
+
+
+class EqualizerWindow:
+    """The Settings > "Equalizer..." window: an on/off button, a preset list
+    (built-in + your own), 10 vertical band sliders (-12..+12 dB) applied
+    live, and buttons to save the current sliders as a named preset, delete
+    one of your presets, or reset to flat. All state lives on the App
+    (App.set_eq); this window just shows and edits it."""
+
+    def __init__(self, app):
+        """Build the window and show the current EQ state."""
+        self.app = app
+        window = tk.Toplevel(app.root)
+        window.title("Equalizer")
+        window.transient(app.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        self.window = window
+        self._apply_job = None
+        self._updating = False  # True while refresh() moves the sliders
+
+        body = ttk.Frame(window, padding=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(body)
+        top.pack(side=tk.TOP, fill=tk.X)
+        self.toggle_button = ttk.Button(
+            top, width=16, style="PanelAction.TButton", command=self.toggle)
+        self.toggle_button.pack(side=tk.LEFT)
+        self.status_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.status_var,
+                  style="ToolbarLabel.TLabel").pack(side=tk.LEFT, padx=(10, 0))
+
+        main = ttk.Frame(body)
+        main.pack(side=tk.TOP, fill=tk.BOTH, pady=(10, 0))
+
+        # Preset list (left).
+        left = ttk.Frame(main)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        ttk.Label(left, text="Presets", style="ToolbarLabel.TLabel").pack(
+            side=tk.TOP, anchor="w")
+        self.preset_list = tk.Listbox(left, height=14, width=22,
+                                      exportselection=False, bd=1,
+                                      highlightthickness=0)
+        self.preset_list.pack(side=tk.TOP, fill=tk.Y, pady=(2, 0))
+        self.preset_list.bind("<<ListboxSelect>>", self._on_preset_selected)
+
+        # Band sliders (right): value label above, slider, frequency below.
+        bands = ttk.Frame(main)
+        bands.pack(side=tk.LEFT, padx=(14, 0))
+        self.band_vars = []
+        self.band_labels = []
+        for index, hz in enumerate(EQ_BANDS):
+            column = ttk.Frame(bands)
+            column.pack(side=tk.LEFT, padx=3)
+            value_label = ttk.Label(column, width=5, anchor="center")
+            value_label.pack(side=tk.TOP)
+            var = tk.DoubleVar(value=0.0)
+            # Vertical ttk.Scale runs top->bottom, so from_=+12 puts the
+            # boost end at the top.
+            ttk.Scale(column, from_=12.0, to=-12.0, orient=tk.VERTICAL,
+                      length=200, variable=var,
+                      command=lambda _v, i=index: self._on_slider(i)).pack(
+                side=tk.TOP, pady=2)
+            text = f"{hz // 1000}k" if hz >= 1000 else str(hz)
+            ttk.Label(column, text=text, anchor="center").pack(side=tk.TOP)
+            self.band_vars.append(var)
+            self.band_labels.append(value_label)
+
+        buttons = ttk.Frame(body)
+        buttons.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
+        ttk.Button(buttons, text="Save as Preset...", style="PanelAction.TButton",
+                   command=self.save_preset).pack(side=tk.LEFT)
+        self.delete_button = ttk.Button(
+            buttons, text="Delete Preset", style="PanelAction.TButton",
+            command=self.delete_preset)
+        self.delete_button.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(buttons, text="Reset to Flat", style="PanelAction.TButton",
+                   command=lambda: self.app.set_eq(
+                       gains=EQ_PRESETS["Flat"], preset="Flat")).pack(
+            side=tk.LEFT, padx=(4, 0))
+        ttk.Button(buttons, text="Close", style="PanelAction.TButton",
+                   command=self.close).pack(side=tk.RIGHT)
+        ttk.Label(body, text="The EQ applies to FLAC, MP3, WAV and OGG files.").pack(
+            side=tk.TOP, anchor="w", pady=(8, 0))
+
+        self.refresh()
+        self.apply_palette(app.palette)
+
+    # -- showing state ---------------------------------------------------------
+    def refresh(self):
+        """Show the App's current EQ state: button text, status line,
+        preset list (with the active one selected) and slider positions."""
+        app = self.app
+        self.toggle_button.configure(
+            text="Equalizer: On" if app.eq_enabled else "Equalizer: Off")
+        self.status_var.set(app.eq_status_text())
+
+        # Preset list: built-ins, then the user's own marked with a star.
+        self._preset_names = list(EQ_PRESETS) + sorted(app.eq_custom_presets)
+        self.preset_list.delete(0, tk.END)
+        for name in self._preset_names:
+            label = f"\u2605 {name}" if name in app.eq_custom_presets else name
+            self.preset_list.insert(tk.END, label)
+        if app.eq_preset in self._preset_names:
+            index = self._preset_names.index(app.eq_preset)
+            self.preset_list.selection_set(index)
+            self.preset_list.see(index)
+        self.delete_button.state(
+            ["!disabled"] if app.eq_preset in app.eq_custom_presets else ["disabled"])
+
+        self._updating = True
+        for var, label, gain in zip(self.band_vars, self.band_labels, app.eq_gains):
+            var.set(gain)
+            label.configure(text=f"{gain:+.0f}" if gain else "0")
+        self._updating = False
+
+    def apply_palette(self, palette):
+        """Recolor the parts ttk styles don't cover (window, list, title bar)."""
+        self.window.configure(bg=palette["bg"])
+        self.preset_list.configure(
+            bg=palette["field_bg"], fg=palette["field_fg"],
+            selectbackground=palette["select_bg"],
+            selectforeground=palette["select_fg"])
+        self.app._apply_title_bar_colors(palette, self.window)
+
+    # -- editing -------------------------------------------------------------------
+    def toggle(self):
+        """Turn the EQ on/off."""
+        self.app.set_eq(enabled=not self.app.eq_enabled)
+        self.app.status_var.set(self.app.eq_status_text())
+
+    def _on_preset_selected(self, _event=None):
+        """A preset was clicked: load its gains."""
+        selection = self.preset_list.curselection()
+        if not selection:
+            return
+        name = self._preset_names[selection[0]]
+        self.app.set_eq(gains=self.app.all_eq_presets()[name], preset=name)
+
+    def _on_slider(self, index):
+        """A slider moved: snap it to whole dB, update its label, and apply
+        all gains shortly after (debounced, so dragging doesn't redesign
+        the filter on every pixel). Moving a slider makes the setting
+        "Custom (unsaved)" unless it still matches the selected preset."""
+        if self._updating:
+            return
+        value = round(self.band_vars[index].get())
+        self.band_labels[index].configure(text=f"{value:+d}" if value else "0")
+        if self._apply_job is not None:
+            self.window.after_cancel(self._apply_job)
+        self._apply_job = self.window.after(60, self._apply_sliders)
+
+    def _apply_sliders(self):
+        """Send the sliders' (rounded) gains to the App."""
+        self._apply_job = None
+        gains = [float(round(var.get())) for var in self.band_vars]
+        preset = self.app.eq_preset
+        if preset is not None and self.app.all_eq_presets().get(preset) != gains:
+            preset = None
+        self.app.set_eq(gains=gains, preset=preset)
+
+    def save_preset(self):
+        """Save the current sliders as a named preset of your own (asks for
+        the name; saving over one of your presets replaces it)."""
+        app = self.app
+        name = simpledialog.askstring(
+            "Save EQ Preset", "Preset name:", parent=self.window,
+            initialvalue=app.eq_preset if app.eq_preset in app.eq_custom_presets else "")
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in EQ_PRESETS:
+            app.status_var.set(f"'{name}' is a built-in preset -- pick another name")
+            return
+        app.eq_custom_presets[name] = list(app.eq_gains)
+        app.set_eq(preset=name)
+        app.status_var.set(f"Saved EQ preset '{name}'")
+
+    def delete_preset(self):
+        """Delete the selected preset (only your own can be deleted); the
+        sliders keep their values."""
+        app = self.app
+        name = app.eq_preset
+        if name not in app.eq_custom_presets:
+            return
+        del app.eq_custom_presets[name]
+        app.set_eq(preset=None)
+        app.status_var.set(f"Deleted EQ preset '{name}'")
+
+    def close(self):
+        """Close the window (the EQ keeps running with its settings)."""
+        if self._apply_job is not None:
+            self.window.after_cancel(self._apply_job)
+            self._apply_sliders()
+        self.app.eq_window = None
+        self.window.destroy()

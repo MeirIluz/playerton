@@ -6,6 +6,7 @@ class Player:
     """App state: current playlist, library roots and playback position."""
 
     def __init__(self):
+        """Start with an empty playlist, library, queue and ignored set."""
         self.playlist = []  # list of file paths
         self.library_roots = []  # list of folder paths
         self.current_index = None  # index into playlist of the active track

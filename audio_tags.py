@@ -34,6 +34,7 @@ _ID3_FRAME_IDS = {key: cls.__name__ for key, cls in _ID3_FRAME_CLASSES.items()}
 
 
 def format_duration(seconds):
+    """Format seconds as "m:ss" (or "h:mm:ss"); "" for zero/unknown."""
     if not seconds:
         return ""
     seconds = int(seconds)
@@ -65,6 +66,7 @@ def read_track_tags(path):
 
 
 def get_track_duration(path):
+    """Length of an audio file in seconds (0 if it can't be read)."""
     try:
         audio = MutagenFile(path)
     except Exception:
@@ -110,11 +112,13 @@ def get_embedded_art_bytes(path):
 
 
 def make_placeholder_art(size=(72, 72)):
+    """Plain gray square PhotoImage, shown when a track has no cover art."""
     image = Image.new("RGB", size, color="#3a3a3a")
     return ImageTk.PhotoImage(image)
 
 
 def make_placeholder_art_pil(size=(72, 72)):
+    """Plain gray square PIL image, used when a track has no cover art."""
     return Image.new("RGB", size, color="#3a3a3a")
 
 
@@ -144,6 +148,7 @@ def get_track_art_pil(path, size=(72, 72)):
 
 
 def get_track_art_image(path, size=(72, 72)):
+    """Embedded cover art of `path` as a Tk PhotoImage, or None."""
     image = get_track_art_pil(path, size)
     if image is None:
         return None
@@ -215,6 +220,7 @@ def read_common_tags(path):
 
 
 def _read_raw_id3_into(tags, result):
+    """Copy the common fields from raw ID3 frames into `result`."""
     for key, frame_id in _ID3_FRAME_IDS.items():
         frame = tags.get(frame_id)
         if frame is not None and frame.text:
@@ -254,6 +260,8 @@ def apply_common_tags(path, updates, clear_blank=False):
 
 
 def _apply_raw_id3_updates(tags, updates, clear_blank):
+    """Write `updates` into raw ID3 frames (blank values delete the frame
+    when `clear_blank`); returns True if anything changed."""
     changed = False
     for key, value in updates.items():
         frame_cls = _ID3_FRAME_CLASSES.get(key)
