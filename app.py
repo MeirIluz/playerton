@@ -11,6 +11,7 @@ a "# -- name --" comment, in this order:
   now playing bar       spinning-disc art, title/artist, controls, progress
   right-side box        the small |<< >>| box at the right of Now Playing
   color-fade helper     the smooth color fades used all over the UI
+  keyboard shortcuts    Space / Ctrl+arrows in-app; global media keys
   album info            Album Info window (links to RYM, Discogs, ...)
   equalizer             Settings > Equalizer: presets, custom presets
                         (the audio side lives in audio_engine.py)
@@ -51,7 +52,7 @@ import zipfile
 from collections import Counter
 
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, colorchooser
+from tkinter import ttk, filedialog, simpledialog, colorchooser, messagebox
 import tkinter.font as tkfont
 
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -60,6 +61,7 @@ import pygame
 from audio_engine import AudioOutput, EQ_BANDS, EQ_PRESETS, clamp_gains
 from lyrics import find_local_lyrics, fetch_online_lyrics
 from album_info import search_links, find_musicbrainz_links
+from media_keys import GlobalMediaKeys
 
 from constants import (
     MUSIC_EXTENSIONS, MUSIC_FILETYPES, IMAGE_FILETYPES,
@@ -271,6 +273,13 @@ class App:
         self._lyrics_queue = queue.Queue()
         self._lyrics_current_line = None
 
+        # Keyboard media keys (Play/Pause, Next, Previous, Stop) as global
+        # hotkeys, so they work while Playerton isn't focused -- see
+        # media_keys.py. Settings > Global Media Keys turns this off.
+        self.global_media_keys_var = tk.BooleanVar(
+            value=bool(self.cache.get("global_media_keys", True)))
+        self.media_keys = GlobalMediaKeys()
+
         # Fonts imported via the theme editor live in FONTS_DIR and are
         # loaded (privately, for this app only) on every launch.
         self._register_imported_fonts()
@@ -350,6 +359,9 @@ class App:
         self._apply_theme()
         self._restore_from_cache()
         self.root.after(200, self._bring_to_front)
+        self._bind_shortcuts()
+        if self.global_media_keys_var.get():
+            self._start_media_keys(announce=False)
 
         # Escape clears whichever tree currently has a multi-selection
         # (playlist table, library tree, or queue panel) -- a quick way
@@ -601,12 +613,18 @@ class App:
             label="Fetch Lyrics Online (LRCLIB)",
             variable=self.online_lyrics_var,
             command=self._on_toggle_online_lyrics)
+        settings_menu.add_checkbutton(
+            label="Global Media Keys (work when not focused)",
+            variable=self.global_media_keys_var,
+            command=self._on_toggle_global_media_keys)
         settings_menu.add_separator()
         settings_menu.add_command(
             label="Equalizer...", command=self.open_equalizer)
         menu_bar.add_cascade(label="Settings", menu=settings_menu)
 
         help_menu = tk.Menu(menu_bar, tearoff=0)
+        help_menu.add_command(
+            label="Keyboard Shortcuts...", command=self.show_keyboard_shortcuts)
         help_menu.add_command(label="About")
         menu_bar.add_cascade(label="Help", menu=help_menu)
 
@@ -1222,6 +1240,88 @@ class App:
         """True if `value` is a "#rrggbb" color string."""
         return isinstance(value, str) and re.fullmatch(
             r"#[0-9a-fA-F]{6}", value) is not None
+
+    # -- keyboard shortcuts --------------------------------------------------------
+    # In-app shortcuts: only fire while a Playerton window has focus (they're
+    # ordinary Tk bindings), and never while typing in a text box.
+    SHORTCUTS = (
+        ("<space>", "Space", "Play / Pause", "on_play_pause_toggle"),
+        ("<Control-Right>", "Ctrl + Right", "Next track", "on_next"),
+        ("<Control-Left>", "Ctrl + Left", "Previous track", "on_previous"),
+    )
+    # Widget classes where keys must keep their normal typing/navigation use.
+    _TEXT_INPUT_CLASSES = ("Entry", "TEntry", "Text", "Spinbox", "TSpinbox",
+                           "TCombobox", "Listbox")
+
+    def _bind_shortcuts(self):
+        """Install the in-app shortcuts on every window of the app."""
+        for sequence, _keys, _what, method in self.SHORTCUTS:
+            self.root.bind_all(
+                sequence, lambda e, m=method: self._on_shortcut(e, m))
+        # Treeview's own Left/Right bindings (collapse/expand) would also
+        # fire for Ctrl+Left/Right; these more specific do-nothing class
+        # bindings take precedence, leaving the keys to the shortcut.
+        for sequence in ("<Control-Left>", "<Control-Right>"):
+            self.root.bind_class("Treeview", sequence, lambda _e: None)
+
+    def _on_shortcut(self, event, method):
+        """Run a shortcut's action unless the user is typing in a box."""
+        if event.widget.winfo_class() in self._TEXT_INPUT_CLASSES:
+            return None
+        getattr(self, method)()
+        return "break"
+
+    def _start_media_keys(self, announce=True):
+        """Register the global media keys and start polling for presses."""
+        failed = self.media_keys.start()
+        if failed and len(failed) == 4:
+            self.status_var.set(
+                "Couldn't register the media keys (another app may own them)")
+        elif failed:
+            self.status_var.set(
+                "Media keys on, except: " + ", ".join(failed)
+                + " (used by another app)")
+        elif announce:
+            self.status_var.set("Global media keys: on")
+        if self.media_keys.running:
+            self.root.after(100, self._poll_media_keys)
+
+    def _poll_media_keys(self):
+        """Main thread: run the action for every media key pressed since the
+        last poll (the presses arrive from media_keys' background thread)."""
+        if not self.media_keys.running:
+            return
+        actions = {"play_pause": self.on_play_pause_toggle, "next": self.on_next,
+                   "previous": self.on_previous, "stop": self.on_stop}
+        while True:
+            try:
+                action = self.media_keys.actions.get_nowait()
+            except queue.Empty:
+                break
+            actions[action]()
+        self.root.after(100, self._poll_media_keys)
+
+    def _on_toggle_global_media_keys(self):
+        """Settings > Global Media Keys toggled."""
+        if self.global_media_keys_var.get():
+            self._start_media_keys()
+        else:
+            self.media_keys.stop()
+            self.status_var.set(
+                "Global media keys: off (other apps get the media keys again)")
+
+    def show_keyboard_shortcuts(self):
+        """Help > Keyboard Shortcuts: list every shortcut."""
+        lines = [f"{keys:<14}{what}" for _s, keys, what, _m in self.SHORTCUTS]
+        media = ("on" if self.media_keys.running else "off")
+        messagebox.showinfo(
+            "Keyboard Shortcuts",
+            "While Playerton is focused (not while typing in a box):\n\n"
+            + "\n".join(lines)
+            + "\n\nKeyboard media keys (Play/Pause, Next, Previous, Stop) work"
+            " even when Playerton isn't focused, while Settings > Global Media"
+            f" Keys is on (currently {media}).",
+            parent=self.root)
 
     # -- album info ----------------------------------------------------------------
     def open_album_info(self, path=None):
@@ -4890,6 +4990,7 @@ class App:
             "eq_custom_presets": self.eq_custom_presets,
             "show_lyrics": bool(self.show_lyrics_var.get()),
             "online_lyrics": bool(self.online_lyrics_var.get()),
+            "global_media_keys": bool(self.global_media_keys_var.get()),
             "playlist_bg_path": self.playlist_bg_path,
             "now_playing": now_playing,
             "playlist_columns": [
@@ -4915,8 +5016,9 @@ class App:
         return deduped
 
     def _on_close(self):
-        """Window closed: save the session, then exit."""
+        """Window closed: save the session, release the media keys, exit."""
         self._save_cache()
+        self.media_keys.stop()
         self.root.destroy()
 
     def _relaunch_app(self):

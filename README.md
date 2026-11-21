@@ -23,6 +23,10 @@ table, and has a Now Playing bar with the album art drawn as a spinning disc.
 - **Look**: several themes, a live custom theme editor (colors, fonts, imported
   font files), colors taken from a background photo, and a title bar and menu bar
   that match the theme.
+- **Keyboard**: Space (play/pause), Ctrl+Right (next) and Ctrl+Left (previous)
+  while Playerton is focused. The keyboard's media keys work even when it isn't
+  (they can be turned off in **Settings > Global Media Keys**). See
+  **Help > Keyboard Shortcuts**.
 - **Other**: drag-to-scrub seek slider, an optional animated GIF window icon,
   tag editing (one track or many), and the last session restored on launch.
 
@@ -68,6 +72,7 @@ contain absolute paths into it, so renaming it would break them.
 | `audio_engine.py` | Audio output: pygame normally, the miniaudio + numpy equalizer engine when the EQ is on |
 | `lyrics.py` | Finds lyrics (`.lrc` file, embedded, LRCLIB) and parses synced lyrics |
 | `album_info.py` | Album Info links: site searches and the MusicBrainz lookup |
+| `media_keys.py` | Registers the keyboard media keys as global hotkeys (Windows) |
 | `audio_tags.py` | Tag reading and writing, album art |
 | `image_utils.py` | Background photo fitting and fading, palette from an image |
 | `playlist_cue.py` | Reads and writes playlists as `.cue` files |
@@ -84,6 +89,8 @@ Every function has a docstring explaining what it does.
   length to lrclib.net. Turn it off in **Settings > Fetch Lyrics Online**.
   Opening Album Info sends the artist and album name to musicbrainz.org. The
   search links send nothing until you click one.
+- **Media keys:** while Global Media Keys is on, the keyboard's media keys
+  control Playerton rather than other players (Spotify, browser tabs).
 - **Logs:** the packaged app writes warnings to `playerton.log` in the settings
   folder. When run from source, debug output goes to the console.
 
