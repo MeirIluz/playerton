@@ -3512,9 +3512,7 @@ class App:
             menu.add_command(
                 label="More by Same Artist",
                 command=lambda: self._filter_by("artist", primary_path) if primary_path else None)
-            menu.add_command(
-                label="Album Info...",
-                command=lambda: self.open_album_info(primary_path) if primary_path else None)
+        self._add_album_info_entry(menu, primary_paths)
         menu.add_separator()
         menu.add_cascade(
             label="Add to Playlist",
@@ -3535,6 +3533,44 @@ class App:
         menu.add_command(label="Properties",
                          command=lambda: self.open_properties(selected_paths))
         return menu
+
+    # Most albums listed in the "Album Info" submenu for a big folder.
+    _ALBUM_MENU_LIMIT = 25
+
+    def _add_album_info_entry(self, menu, paths):
+        """Add "Album Info..." to a right-click menu for the tracks `paths`:
+        a plain item when they're all one album (a song, an album folder),
+        or a submenu listing each album when there are several (an artist
+        folder, a playlist, ...)."""
+        albums = {}  # (artist, album) -> a track of that album
+        for path in paths:
+            tags = self.track_tags.get(path)
+            if tags is None:
+                continue
+            album = (tags.get("album") or "").strip()
+            if not album:
+                continue
+            artist = (tags.get("albumartist") or tags.get("artist") or "").strip()
+            albums.setdefault((artist.lower(), album.lower()), (artist, album, path))
+        if not albums:
+            menu.add_command(label="Album Info...", state=tk.DISABLED)
+            return
+        if len(albums) == 1:
+            _artist, _album, path = next(iter(albums.values()))
+            menu.add_command(label="Album Info...",
+                             command=lambda: self.open_album_info(path))
+            return
+        submenu = tk.Menu(menu, tearoff=0, **self._menu_colors())
+        entries = sorted(albums.values(), key=lambda e: (e[0].lower(), e[1].lower()))
+        for artist, album, path in entries[:self._ALBUM_MENU_LIMIT]:
+            label = f"{artist} - {album}" if artist else album
+            submenu.add_command(label=label,
+                                command=lambda p=path: self.open_album_info(p))
+        if len(entries) > self._ALBUM_MENU_LIMIT:
+            submenu.add_command(
+                label=f"... and {len(entries) - self._ALBUM_MENU_LIMIT} more",
+                state=tk.DISABLED)
+        menu.add_cascade(label="Album Info", menu=submenu)
 
     def _build_add_to_playlist_menu(self, paths):
         """Submenu listing every existing cue playlist (add `paths` to it)
