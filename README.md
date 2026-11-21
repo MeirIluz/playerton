@@ -16,7 +16,10 @@ table, and has a Now Playing bar with the album art drawn as a spinning disc.
   Works on FLAC, MP3, WAV and OGG.
 - **Lyrics panel**: reads `.lrc` files and embedded lyrics, can look songs up on
   [LRCLIB](https://lrclib.net), highlights synced lyrics as the song plays, and
-  seeks when you click a line.
+  seeks when you click a line. The **Lyrics** button shows or hides it.
+- **Album Info**: a button (and a right-click menu item) with links to the album
+  on RateYourMusic, Discogs, MusicBrainz, AllMusic, Last.fm, Bandcamp and
+  Wikipedia, plus the album's own pages found through MusicBrainz.
 - **Look**: several themes, a live custom theme editor (colors, fonts, imported
   font files), colors taken from a background photo, and a title bar and menu bar
   that match the theme.
@@ -60,10 +63,11 @@ contain absolute paths into it, so renaming it would break them.
 | File | What it does |
 |---|---|
 | `file_explorer.py` | Entry point: run this to start the player |
-| `app.py` | The whole UI and player logic (`App`), plus the theme editor and equalizer windows. A table of contents at the top lists its sections. |
+| `app.py` | The whole UI and player logic (`App`), plus the theme editor, equalizer and Album Info windows. A table of contents at the top lists its sections. |
 | `styles.py` | All appearance: color themes, fonts, and the CSS-like `STYLESHEET` |
 | `audio_engine.py` | Audio output: pygame normally, the miniaudio + numpy equalizer engine when the EQ is on |
 | `lyrics.py` | Finds lyrics (`.lrc` file, embedded, LRCLIB) and parses synced lyrics |
+| `album_info.py` | Album Info links: site searches and the MusicBrainz lookup |
 | `audio_tags.py` | Tag reading and writing, album art |
 | `image_utils.py` | Background photo fitting and fading, palette from an image |
 | `playlist_cue.py` | Reads and writes playlists as `.cue` files |
@@ -78,6 +82,8 @@ Every function has a docstring explaining what it does.
 
 - **Privacy:** online lyrics lookup sends only a song's artist, title, album and
   length to lrclib.net. Turn it off in **Settings > Fetch Lyrics Online**.
+  Opening Album Info sends the artist and album name to musicbrainz.org. The
+  search links send nothing until you click one.
 - **Logs:** the packaged app writes warnings to `playerton.log` in the settings
   folder. When run from source, debug output goes to the console.
 

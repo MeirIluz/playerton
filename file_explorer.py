@@ -12,6 +12,7 @@ The GUI + logic lives in app.py (the App class). Supporting modules:
                       color palette from an image
   - lyrics.py         finding lyrics (.lrc file, embedded tags, LRCLIB
                       online lookup) and parsing synced LRC lyrics
+  - album_info.py     "Album Info" links: site searches + MusicBrainz lookup
   - archive_utils.py  .zip album archive detection + filename parsing
   - playlist_cue.py   reading/writing playlists as .cue files
   - player_state.py   Player: plain playlist/queue/position state

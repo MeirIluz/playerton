@@ -11,6 +11,7 @@ a "# -- name --" comment, in this order:
   now playing bar       spinning-disc art, title/artist, controls, progress
   right-side box        the small |<< >>| box at the right of Now Playing
   color-fade helper     the smooth color fades used all over the UI
+  album info            Album Info window (links to RYM, Discogs, ...)
   equalizer             Settings > Equalizer: presets, custom presets
                         (the audio side lives in audio_engine.py)
   theming               themes, title bar colors, fonts, custom theme,
@@ -44,6 +45,7 @@ import sys
 import queue
 import tempfile
 import threading
+import webbrowser
 import time
 import zipfile
 from collections import Counter
@@ -57,6 +59,7 @@ import pygame
 
 from audio_engine import AudioOutput, EQ_BANDS, EQ_PRESETS, clamp_gains
 from lyrics import find_local_lyrics, fetch_online_lyrics
+from album_info import search_links, find_musicbrainz_links
 
 from constants import (
     MUSIC_EXTENSIONS, MUSIC_FILETYPES, IMAGE_FILETYPES,
@@ -930,6 +933,20 @@ class App:
             command=self.toggle_repeat)
         self.repeat_button.pack(side=tk.LEFT, padx=4)
 
+        # Lyrics panel toggle (same as View > Show Lyrics Panel; shown
+        # sunken while the panel is visible).
+        self.lyrics_button = tk.Button(
+            controls_row, text="Lyrics", width=8,
+            relief=tk.SUNKEN if self.show_lyrics_var.get() else tk.RAISED,
+            command=self.toggle_lyrics_panel)
+        self.lyrics_button.pack(side=tk.LEFT, padx=4)
+
+        # Links to the playing album on RYM, Discogs, MusicBrainz, ...
+        self.album_info_button = tk.Button(
+            controls_row, text="Album Info", width=10,
+            command=lambda: self.open_album_info())
+        self.album_info_button.pack(side=tk.LEFT, padx=4)
+
         progress_row = ttk.Frame(info_frame)
         progress_row.pack(fill=tk.X, pady=(6, 0))
 
@@ -1205,6 +1222,25 @@ class App:
         """True if `value` is a "#rrggbb" color string."""
         return isinstance(value, str) and re.fullmatch(
             r"#[0-9a-fA-F]{6}", value) is not None
+
+    # -- album info ----------------------------------------------------------------
+    def open_album_info(self, path=None):
+        """Open the Album Info window for `path`'s album (default: the
+        playing track, else the selected one)."""
+        path = path or self._current_playing_path()
+        if path is None:
+            selection = self.playlist_tree.selection()
+            path = selection[0] if selection else None
+        if path is None:
+            self.status_var.set("Play or select a track to see its album info")
+            return
+        tags = self.track_tags.get(path) or self._read_all_track_tags(path)
+        artist = tags.get("albumartist") or tags.get("artist") or ""
+        album = tags.get("album") or ""
+        if not album:
+            self.status_var.set("This track has no album tag to look up")
+            return
+        AlbumInfoWindow(self, path, artist, album, (tags.get("date") or "")[:4])
 
     # -- equalizer -------------------------------------------------------------
     def open_equalizer(self):
@@ -1769,9 +1805,18 @@ class App:
             font=resolve_font(FONTS["lyrics_current"], palette))
         self.lyrics_text.tag_raise("current")
 
+    def toggle_lyrics_panel(self):
+        """The Now Playing "Lyrics" button: show/hide the lyrics panel."""
+        self.show_lyrics_var.set(not self.show_lyrics_var.get())
+        self._on_toggle_lyrics_panel()
+
     def _on_toggle_lyrics_panel(self):
-        """View > Show Lyrics Panel: add/remove the panel (and load lyrics
-        for the current track when it's shown)."""
+        """Show/hide the lyrics panel to match show_lyrics_var (set by the
+        View menu checkbox or the Lyrics button), loading lyrics for the
+        current track when it's shown."""
+        if hasattr(self, "lyrics_button"):
+            self.lyrics_button.config(
+                relief=tk.SUNKEN if self.show_lyrics_var.get() else tk.RAISED)
         if self.show_lyrics_var.get():
             self.body_pane.add(self.lyrics_frame, weight=1)
             path = self._current_playing_path()
@@ -3467,6 +3512,9 @@ class App:
             menu.add_command(
                 label="More by Same Artist",
                 command=lambda: self._filter_by("artist", primary_path) if primary_path else None)
+            menu.add_command(
+                label="Album Info...",
+                command=lambda: self.open_album_info(primary_path) if primary_path else None)
         menu.add_separator()
         menu.add_cascade(
             label="Add to Playlist",
@@ -5310,3 +5358,123 @@ class EqualizerWindow:
             self._apply_sliders()
         self.app.eq_window = None
         self.window.destroy()
+
+
+class AlbumInfoWindow:
+    """Album Info: the album's cover and tags, one-click searches on music
+    sites, and -- looked up on MusicBrainz in the background -- the album's
+    own pages there and on the sites MusicBrainz links to. Clicking a link
+    opens it in the browser; right-clicking copies it."""
+
+    def __init__(self, app, path, artist, album, year):
+        """Build the window for `album` by `artist` and start the lookup."""
+        self.app = app
+        self.palette = app.palette
+        window = tk.Toplevel(app.root)
+        window.title(f"Album Info - {album}")
+        window.transient(app.root)
+        window.configure(bg=app.palette["bg"])
+        self.window = window
+        self._queue = queue.Queue()
+
+        body = ttk.Frame(window, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # Header: cover art + album / artist / year.
+        header = ttk.Frame(body)
+        header.pack(side=tk.TOP, fill=tk.X)
+        art = get_track_art_pil(path, size=(96, 96))
+        if art is not None:
+            self._art_photo = ImageTk.PhotoImage(art)
+            tk.Label(header, image=self._art_photo, bd=0,
+                     bg=app.palette["bg"]).pack(side=tk.LEFT, padx=(0, 12))
+        text = ttk.Frame(header)
+        text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(text, text=album, style="NowPlayingTitle.TLabel",
+                  wraplength=380).pack(anchor="w")
+        ttk.Label(text, text=artist or "Unknown Artist",
+                  style="NowPlayingArtist.TLabel").pack(anchor="w")
+        if year:
+            ttk.Label(text, text=year).pack(anchor="w")
+
+        # Search links (instant).
+        ttk.Label(body, text="Search on", style="QueueHeader.TLabel").pack(
+            side=tk.TOP, anchor="w", pady=(12, 2))
+        search_row = ttk.Frame(body)
+        search_row.pack(side=tk.TOP, fill=tk.X)
+        for index, (site, url) in enumerate(search_links(artist, album)):
+            self._link(search_row, site, url).grid(
+                row=index // 4, column=index % 4, sticky="w", padx=(0, 18), pady=2)
+
+        # Direct links (MusicBrainz lookup, filled in when it returns).
+        ttk.Label(body, text="Album pages (via MusicBrainz)",
+                  style="QueueHeader.TLabel").pack(side=tk.TOP, anchor="w", pady=(14, 2))
+        self.direct_frame = ttk.Frame(body)
+        self.direct_frame.pack(side=tk.TOP, fill=tk.X)
+        self.direct_status = ttk.Label(self.direct_frame, text="Looking up on MusicBrainz...")
+        self.direct_status.pack(anchor="w")
+
+        bottom = ttk.Frame(body)
+        bottom.pack(side=tk.TOP, fill=tk.X, pady=(14, 0))
+        ttk.Label(bottom, text="Click a link to open it; right-click to copy.").pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Close", style="PanelAction.TButton",
+                   command=window.destroy).pack(side=tk.RIGHT)
+        app._apply_title_bar_colors(app.palette, window)
+
+        def work():
+            try:
+                self._queue.put((find_musicbrainz_links(artist, album), None))
+            except Exception as exc:
+                self._queue.put((None, exc))
+
+        threading.Thread(target=work, name="album-info", daemon=True).start()
+        window.after(150, self._poll)
+
+    def _link(self, parent, text, url):
+        """A clickable, underlined link label: click opens `url` in the
+        browser, right-click copies it to the clipboard."""
+        palette = self.palette
+        label = tk.Label(parent, text=text, cursor="hand2", bd=0,
+                         bg=palette["bg"], fg=palette["select_bg"],
+                         font=resolve_font(FONTS["base"] + ("underline",), palette))
+        label.bind("<Button-1>", lambda _e: webbrowser.open(url))
+        label.bind("<Button-3>", lambda _e: self._copy(url))
+        label.bind("<Enter>", lambda _e: label.configure(fg=palette["fg"]))
+        label.bind("<Leave>", lambda _e: label.configure(fg=palette["select_bg"]))
+        return label
+
+    def _copy(self, url):
+        """Copy `url` to the clipboard."""
+        self.window.clipboard_clear()
+        self.window.clipboard_append(url)
+        self.app.status_var.set("Link copied")
+
+    def _poll(self):
+        """Main thread: show the MusicBrainz result once the worker is done."""
+        try:
+            result, error = self._queue.get_nowait()
+        except queue.Empty:
+            if self.window.winfo_exists():
+                self.window.after(150, self._poll)
+            return
+        if not self.window.winfo_exists():
+            return
+        self.direct_status.destroy()
+        if error is not None:
+            logger.warning("Album info lookup failed: %r", error)
+            ttk.Label(self.direct_frame, text="Couldn't reach MusicBrainz.").pack(anchor="w")
+            return
+        if result is None:
+            ttk.Label(self.direct_frame,
+                      text="No match on MusicBrainz -- try the searches above.").pack(anchor="w")
+            return
+        matched = f"{result['artist']} - {result['title']}"
+        if result["year"]:
+            matched += f" ({result['year']})"
+        ttk.Label(self.direct_frame, text=f"Matched: {matched}").pack(anchor="w", pady=(0, 4))
+        grid = ttk.Frame(self.direct_frame)
+        grid.pack(anchor="w")
+        links = [("MusicBrainz", result["musicbrainz"])] + list(result["links"])
+        for index, (site, url) in enumerate(links):
+            self._link(grid, site, url).grid(
+                row=index // 4, column=index % 4, sticky="w", padx=(0, 18), pady=2)

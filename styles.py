@@ -419,6 +419,22 @@ STYLESHEET = {
         "highlightbackground": "bg",
         "cursor": "hand2",
     },
+    "#lyrics_button": {
+        # Toggle (sunken = lyrics panel shown); no "relief" for the same
+        # reason as #shuffle_button.
+        "font": FONTS["button"],
+        "bg": "button_bg", "fg": "button_fg",
+        "activebackground": "select_bg", "activeforeground": "select_fg",
+        "highlightbackground": "bg",
+        "cursor": "hand2",
+    },
+    "#album_info_button": {
+        "font": FONTS["button"],
+        "bg": "button_bg", "fg": "button_fg",
+        "activebackground": "select_bg", "activeforeground": "select_fg",
+        "highlightbackground": "bg",
+        "cursor": "hand2",
+    },
     "#art_label": {
         "bg": "field_bg",
     },
